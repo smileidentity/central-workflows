@@ -1,0 +1,27 @@
+name: Check shared PR workflows
+
+on:
+  pull_request_target:
+    types: [opened, reopened]
+  schedule:
+    - cron: '30 16 * * *'
+  workflow_dispatch:
+    inputs:
+      dry-run:
+        description: Report stale PR changes without adding labels or comments
+        type: boolean
+        default: true
+
+permissions:
+  issues: write
+  pull-requests: write
+
+jobs:
+  assign:
+    if: github.event_name == 'pull_request_target'
+    uses: smileidentity/central-workflows/.github/workflows/auto-author-assign.yml@v1
+  stale:
+    if: github.event_name != 'pull_request_target'
+    uses: smileidentity/central-workflows/.github/workflows/stale.yml@v1
+    with:
+      dry-run: ${{ inputs.dry-run || false }}

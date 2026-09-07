@@ -1,0 +1,16 @@
+name: Auto author assign
+
+on:
+  workflow_call:
+
+permissions:
+  pull-requests: write
+
+jobs:
+  assign:
+    if: github.event.pull_request && github.event.pull_request.user.type != 'Bot'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      # Only reads PR metadata. Never check out or execute pull request code here.
+      - uses: toshimaru/auto-author-assign@a78a94b219445cece8ccf0d45fec60af449f212a # v3.1.0
