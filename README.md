@@ -25,13 +25,13 @@ jobs:
 
 The author caller needs `pull-requests: write`. The stale caller needs `issues: write` and `pull-requests: write`. No shared secrets are required: each workflow uses the calling repository's `GITHUB_TOKEN`.
 
-The private `compliance` repository holds the complete caller templates and opens PRs to distribute them. It excludes this repository so it cannot replace these implementations with callers to themselves.
+An internal distribution job holds the complete caller templates and opens PRs to distribute them. It excludes this repository so it cannot replace these implementations with callers to themselves.
 
 Repository and organisation Actions policies must allow these workflows and the actions they use. The author workflow uses `pull_request_target` only for metadata operations; never add a checkout of PR code or execute code from a PR.
 
 ## Releases
 
-`v1` is the maintained release branch. Update it to a tested commit from `main` for backwards-compatible fixes. Callers receive those fixes without a rollout PR. Changes to caller events, schedules or permissions need a distribution PR from `compliance`.
+`v1` is the maintained release branch. Update it to a tested commit from `main` for backwards-compatible fixes. Callers receive those fixes without a rollout PR. Changes to caller events, schedules or permissions need a new distribution PR.
 
 Third-party actions are pinned to commit SHAs. Keep this public repository free of credentials and private configuration.
 
