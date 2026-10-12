@@ -1,0 +1,162 @@
+name: Record deploy status
+
+# Call this after a successful deploy. It keeps one badge per environment on the
+# caller's deploy-status branch and, given a Slack token and canvas, one line per
+# environment on a shared Slack canvas.
+on:
+  workflow_call:
+    inputs:
+      environment:
+        description: Environment name, used as the badge file name and label (letters, digits, dot, dash, underscore)
+        type: string
+        required: true
+      ref:
+        description: The tag or branch that was deployed
+        type: string
+        required: true
+      sha:
+        description: The commit that was deployed
+        type: string
+        default: ''
+      canvas-id:
+        description: Slack canvas to update. Leave empty to skip Slack.
+        type: string
+        default: ''
+    secrets:
+      slack-token:
+        description: Slack bot token with canvases:read and canvases:write
+        required: false
+
+permissions:
+  contents: write
+
+jobs:
+  status:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      # Both later steps put these inputs into files and markdown, so check them once, first.
+      - id: validate
+        name: Check the inputs
+        shell: bash
+        env:
+          ENVIRONMENT: ${{ inputs.environment }}
+          SHA: ${{ inputs.sha }}
+        run: |
+          if [[ ! "$ENVIRONMENT" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
+            echo "::error::Environment '$ENVIRONMENT' must be letters, digits, dot, dash or underscore"; exit 1
+          fi
+          if [ -n "$SHA" ] && [[ ! "$SHA" =~ ^[0-9a-fA-F]{7,64}$ ]]; then
+            echo "::error::sha must be a hexadecimal commit id"; exit 1
+          fi
+
+      - id: badge
+        name: Update the badge on the deploy-status branch
+        shell: bash
+        env:
+          ENVIRONMENT: ${{ inputs.environment }}
+          REF: ${{ inputs.ref }}
+          SHA: ${{ inputs.sha }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          export LC_ALL=C.UTF-8
+          esc() { sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g' -e 's/"/\&quot;/g' <<<"$1"; }
+
+          git init -q status && cd status
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          # Pass the token through the environment, not argv, and mask its base64 form in logs.
+          auth=$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 | tr -d '\n')
+          echo "::add-mask::$auth"
+          export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=http.extraheader GIT_CONFIG_VALUE_0="AUTHORIZATION: basic $auth"
+          git remote add origin "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY.git"
+
+          # Tags are releases (green); a branch on an environment stands out (orange).
+          colour='#fe7d37'
+          if [ -n "$(git ls-remote --tags origin "refs/tags/$REF")" ]; then colour='#4c1'; fi
+          lw=$(( ${#ENVIRONMENT} * 7 + 10 )); mw=$(( ${#REF} * 7 + 10 )); w=$(( lw + mw ))
+          label=$(esc "$ENVIRONMENT"); msg=$(esc "$REF")
+          title="$label: $msg${SHA:+ (${SHA:0:7})}, deployed $(date -u '+%Y-%m-%d %H:%M') UTC by $(esc "$GITHUB_ACTOR")"
+          badge="<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"$w\" height=\"20\" role=\"img\" aria-label=\"$label: $msg\"><title>$title</title><linearGradient id=\"s\" x2=\"0\" y2=\"100%\"><stop offset=\"0\" stop-color=\"#bbb\" stop-opacity=\".1\"/><stop offset=\"1\" stop-opacity=\".1\"/></linearGradient><clipPath id=\"r\"><rect width=\"$w\" height=\"20\" rx=\"3\" fill=\"#fff\"/></clipPath><g clip-path=\"url(#r)\"><rect width=\"$lw\" height=\"20\" fill=\"#555\"/><rect x=\"$lw\" width=\"$mw\" height=\"20\" fill=\"$colour\"/><rect width=\"$w\" height=\"20\" fill=\"url(#s)\"/></g><g fill=\"#fff\" text-anchor=\"middle\" font-family=\"Verdana,Geneva,DejaVu Sans,sans-serif\" font-size=\"11\"><text x=\"$(( lw / 2 ))\" y=\"14\">$label</text><text x=\"$(( lw + mw / 2 ))\" y=\"14\">$msg</text></g></svg>"
+
+          # Deploys to other environments can push at the same time, so retry on a rejected push.
+          for attempt in 1 2 3 4 5; do
+            found=0; git ls-remote -q --exit-code --heads origin deploy-status > /dev/null || found=$?
+            if [ "$found" = 0 ] && git fetch -q --depth 1 origin deploy-status; then
+              git checkout -q -f -B deploy-status FETCH_HEAD
+            elif [ "$found" = 2 ]; then
+              # First deploy in this repository: start the branch with no history.
+              git checkout -q -f --orphan "new-$attempt"
+            else
+              sleep $(( attempt * 2 )); continue
+            fi
+            printf '%s\n' "$badge" > "$ENVIRONMENT.svg"
+            git add "$ENVIRONMENT.svg"
+            git commit -q --allow-empty -m "Deploy $REF to $ENVIRONMENT"
+            if git push -q origin HEAD:deploy-status; then exit 0; fi
+            sleep $(( attempt * 2 ))
+          done
+          echo "::error::Could not push the badge to the deploy-status branch"; exit 1
+
+      - id: slack
+        name: Update the Slack canvas
+        # Run even if the badge push failed, but never with inputs that failed the check.
+        if: ${{ !cancelled() && steps.validate.outcome == 'success' }}
+        shell: bash
+        env:
+          ENVIRONMENT: ${{ inputs.environment }}
+          REF: ${{ inputs.ref }}
+          SHA: ${{ inputs.sha }}
+          CANVAS_ID: ${{ inputs.canvas-id }}
+          SLACK_TOKEN: ${{ secrets.slack-token }}
+        run: |
+          if [ -z "$SLACK_TOKEN" ] || [ -z "$CANVAS_ID" ]; then
+            echo "No Slack token or canvas id, so the canvas was not updated."; exit 0
+          fi
+          repo=${GITHUB_REPOSITORY#*/}
+          # Canvas lookups match words, so "production" would also find "production-legacy".
+          # A short hash of repo and environment gives each line a word of its own.
+          key=$(printf '%s/%s' "$repo" "$ENVIRONMENT" | sha256sum | cut -c1-8)
+          # Keep the ref inside its code span: drop backticks and control characters.
+          ref_md=$(printf '%s' "$REF" | tr -d '`[:cntrl:]')
+          line="- **$ENVIRONMENT**: \`$ref_md\`${SHA:+ (${SHA:0:7})} deployed $(date -u '+%-d %b %Y %H:%M') UTC by @$GITHUB_ACTOR · [run]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID) · id $key"
+
+          # A Slack failure must not fail a deploy that has already happened, so warn and stop.
+          # Deploys to two environments can finish together, so retry while the canvas is locked.
+          api() {
+            for attempt in 1 2 3 4 5; do
+              if ! reply=$(curl -sS --max-time 20 -H @<(printf 'Authorization: Bearer %s' "$SLACK_TOKEN") \
+                -H 'Content-Type: application/json; charset=utf-8' --data "$2" "https://slack.com/api/$1"); then
+                echo "::warning::Slack canvas not updated: $1 request failed"; exit 0
+              fi
+              jq -e .ok <<<"$reply" > /dev/null && return
+              [ "$(jq -r .error <<<"$reply")" = canvas_editing_locked ] || break
+              sleep "$attempt"
+            done
+            echo "::warning::Slack canvas not updated: $1: $(jq -r '.error // "no error given"' <<<"$reply")"; exit 0
+          }
+          find_section() {
+            api canvases.sections.lookup "$(jq -cn --arg c "$CANVAS_ID" --arg t "$1" --arg k "$2" \
+              '{canvas_id: $c, criteria: {section_types: [$t], contains_text: $k}}')"
+            section=$(jq -r '.sections[0].id // empty' <<<"$reply")
+          }
+          edit() {
+            api canvases.edit "$(jq -cn --arg c "$CANVAS_ID" --arg op "$1" --arg s "$2" --arg m "$3" \
+              '{canvas_id: $c, changes: [{operation: $op, document_content: {type: "markdown", markdown: $m}}
+                + (if $s == "" then {} else {section_id: $s} end)]}')"
+          }
+
+          find_section list "$key"
+          if [ -n "$section" ]; then
+            edit replace "$section" "$line"
+          else
+            # shortcut: matches any heading containing the repo name as a word, fine while
+            # repo names do not share words; hash the heading like the line if that changes.
+            find_section h2 "$repo"
+            if [ -n "$section" ]; then
+              edit insert_after "$section" "$line"
+            else
+              edit insert_at_end '' "## $repo"$'\n'"$line"
+            fi
+          fi
+          echo "Updated $repo $ENVIRONMENT on the Slack canvas."
