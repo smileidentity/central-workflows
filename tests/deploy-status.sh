@@ -22,7 +22,8 @@ export GITHUB_SERVER_URL="file://$tmp/remote" GITHUB_REPOSITORY=smileidentity/ex
 export GITHUB_ACTOR=octocat GITHUB_RUN_ID=42 GH_TOKEN=unused SHA=0123456789abcdef
 export LABEL=
 
-badge() { (cd "$tmp" && rm -rf status && ENVIRONMENT=$1 REF=$2 bash -eo pipefail -c "$(step badge)"); }
+# A badge run is the check step followed by the badge step, as in the job.
+badge() { (cd "$tmp" && rm -rf status && export ENVIRONMENT=$1 REF=$2 && bash -eo pipefail -c "$(step validate)" && bash -eo pipefail -c "$(step badge)"); }
 show() { git --git-dir="$tmp/remote/smileidentity/example.git" show "deploy-status:$1"; }
 
 # A tag deploy creates the branch and a green badge.
@@ -65,11 +66,18 @@ show other.svg > /dev/null || fail "the competing deploy's badge was lost"
 show race.svg > /dev/null || fail "the badge was not pushed after a rejected push"
 
 # Without a commit, the tooltip leaves it out.
-(cd "$tmp" && rm -rf status && SHA= ENVIRONMENT=nosha REF=v1.2.3 bash -eo pipefail -c "$(step badge)")
+(export SHA=; badge nosha v1.2.3)
 show nosha.svg | grep -q '<title>nosha: v1.2.3, deployed' || fail "badge without a commit has the wrong title"
 
 # Environment names become file names, so anything path-like is refused.
-if badge ../escape v1.2.3 2>/dev/null; then fail "path-like environment was accepted"; fi
+if badge ../escape v1.2.3 > /dev/null 2>&1; then fail "path-like environment was accepted"; fi
+
+# The commit goes into the SVG and the canvas line, so only a hex id is accepted.
+if (export SHA='<x&y'; badge badsha v1.2.3) > /dev/null 2>&1; then fail "non-hex sha was accepted"; fi
+
+# The Slack step must not run when the check fails, even though it runs after a failed badge.
+yq '.jobs.status.steps[] | select(.id == "slack") | .if' "$workflow" | grep -q "steps.validate.outcome == 'success'" \
+  || fail "Slack step does not depend on the input check"
 
 # Slack: a fake curl records each call's method and body and answers from canned replies.
 mkdir -p "$tmp/bin"

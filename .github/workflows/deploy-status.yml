@@ -35,6 +35,21 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
+      # Both later steps put these inputs into files and markdown, so check them once, first.
+      - id: validate
+        name: Check the inputs
+        shell: bash
+        env:
+          ENVIRONMENT: ${{ inputs.environment }}
+          SHA: ${{ inputs.sha }}
+        run: |
+          if [[ ! "$ENVIRONMENT" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
+            echo "::error::Environment '$ENVIRONMENT' must be letters, digits, dot, dash or underscore"; exit 1
+          fi
+          if [ -n "$SHA" ] && [[ ! "$SHA" =~ ^[0-9a-fA-F]{7,64}$ ]]; then
+            echo "::error::sha must be a hexadecimal commit id"; exit 1
+          fi
+
       - id: badge
         name: Update the badge on the deploy-status branch
         shell: bash
@@ -44,9 +59,6 @@ jobs:
           SHA: ${{ inputs.sha }}
           GH_TOKEN: ${{ github.token }}
         run: |
-          if [[ ! "$ENVIRONMENT" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
-            echo "::error::Environment '$ENVIRONMENT' must be letters, digits, dot, dash or underscore"; exit 1
-          fi
           export LC_ALL=C.UTF-8
           esc() { sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g' -e 's/"/\&quot;/g' <<<"$1"; }
 
@@ -88,7 +100,8 @@ jobs:
 
       - id: slack
         name: Update the Slack canvas
-        if: ${{ !cancelled() }}
+        # Run even if the badge push failed, but never with inputs that failed the check.
+        if: ${{ !cancelled() && steps.validate.outcome == 'success' }}
         shell: bash
         env:
           ENVIRONMENT: ${{ inputs.environment }}
