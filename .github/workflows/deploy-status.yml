@@ -81,14 +81,17 @@ jobs:
 
           # Deploys to other environments can push at the same time, so retry on a rejected push.
           for attempt in 1 2 3 4 5; do
-            found=0; git ls-remote -q --exit-code --heads origin deploy-status > /dev/null || found=$?
-            if [ "$found" = 0 ] && git fetch -q --depth 1 origin deploy-status; then
+            # ls-remote patterns match the end of a ref, so "deploy-status" alone would also
+            # find a branch such as ci/deploy-status. Compare the full ref name instead.
+            if ! heads=$(git ls-remote origin refs/heads/deploy-status); then
+              sleep $(( attempt * 2 )); continue
+            fi
+            if [ "$(awk '$2 == "refs/heads/deploy-status"' <<<"$heads")" ]; then
+              git fetch -q --depth 1 origin refs/heads/deploy-status || { sleep $(( attempt * 2 )); continue; }
               git checkout -q -f -B deploy-status FETCH_HEAD
-            elif [ "$found" = 2 ]; then
+            else
               # First deploy in this repository: start the branch with no history.
               git checkout -q -f --orphan "new-$attempt"
-            else
-              sleep $(( attempt * 2 )); continue
             fi
             printf '%s\n' "$badge" > "$ENVIRONMENT.svg"
             git add "$ENVIRONMENT.svg"
