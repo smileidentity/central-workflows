@@ -16,7 +16,9 @@ seed="$tmp/seed"
 git init -q -b main "$seed"
 git -C "$seed" -c user.name=t -c user.email=t@example.com commit -q --allow-empty -m seed
 git -C "$seed" tag v1.2.3
-git -C "$seed" push -q "$tmp/remote/smileidentity/example.git" main v1.2.3
+# A branch whose name ends in deploy-status must not be mistaken for the badge branch.
+git -C "$seed" branch ci/deploy-status
+git -C "$seed" push -q "$tmp/remote/smileidentity/example.git" main v1.2.3 ci/deploy-status
 
 export GITHUB_SERVER_URL="file://$tmp/remote" GITHUB_REPOSITORY=smileidentity/example
 export GITHUB_ACTOR=octocat GITHUB_RUN_ID=42 GH_TOKEN=unused SHA=0123456789abcdef
