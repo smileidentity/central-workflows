@@ -1,0 +1,92 @@
+name: Report scheduled run status
+
+# Call this as the last job of a scheduled workflow. A failed run opens one issue for the
+# calling workflow, or comments on the issue already open. The next passing run closes it.
+on:
+  workflow_call:
+    inputs:
+      failed:
+        description: Whether the run failed. See the README for the expression to pass.
+        type: boolean
+        required: true
+      team:
+        description: Label for the team that owns the workflow, such as team:api. It is added to new issues.
+        type: string
+        required: true
+    secrets:
+      slack-webhook-url:
+        description: Slack incoming webhook to post to when an issue opens, gets a comment or closes. Leave out to skip Slack.
+        required: false
+
+permissions:
+  issues: write
+
+# Two runs of one workflow finishing together must not open two issues.
+concurrency:
+  group: scheduled-run-status-${{ github.repository }}-${{ github.workflow }}
+  cancel-in-progress: false
+
+jobs:
+  report:
+    # Push and pull request runs have their own checks; only unattended runs need an issue.
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - id: issue
+        name: Open, comment on or close the issue
+        shell: bash
+        env:
+          FAILED: ${{ inputs.failed }}
+          TEAM: ${{ inputs.team }}
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          # A manual run on a branch is someone trying a fix, so it must not open or close the issue.
+          default=$(gh api "repos/$GITHUB_REPOSITORY" --jq .default_branch)
+          if [ "$GITHUB_REF_NAME" != "$default" ]; then
+            echo "Ran on $GITHUB_REF_NAME, not $default, so the issue was left alone."; exit 0
+          fi
+
+          # The github context here is the caller's, so this names the calling workflow file.
+          file=${GITHUB_WORKFLOW_REF%@*}; file=${file##*/}
+          # GitHub labels are at most 50 characters.
+          label="red-lane:${file%.*}"; label=${label:0:50}
+          run="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          issue=$(gh issue list --label "$label" --state open --limit 1 --json number --jq '.[0].number // empty')
+          url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/issues/$issue"
+
+          if [ "$FAILED" = true ] && [ -n "$issue" ]; then
+            gh issue comment "$issue" --body "Failed again: $run" > /dev/null
+            message="$GITHUB_REPOSITORY: $GITHUB_WORKFLOW failed again. Run: $run Issue: $url"
+          elif [ "$FAILED" = true ]; then
+            # Creating a label that exists fails, which is fine. Any other problem fails the create below.
+            gh label create "$label" --color d73a4a --description "Open while the $file scheduled run fails" 2> /dev/null || true
+            gh label create "$TEAM" 2> /dev/null || true
+            url=$(gh issue create --title "$GITHUB_WORKFLOW is failing" --label "$label" --label "$TEAM" \
+              --body "The scheduled \`$file\` workflow failed: $run"$'\n\n'"Each failed run adds a comment here. The next passing run on \`$default\` closes this issue.")
+            message="$GITHUB_REPOSITORY: $GITHUB_WORKFLOW failed. Run: $run Issue: $url"
+          elif [ -n "$issue" ]; then
+            gh issue close "$issue" --comment "Passed: $run" > /dev/null
+            message="$GITHUB_REPOSITORY: $GITHUB_WORKFLOW passed again. Run: $run Issue: $url"
+          else
+            echo "Passed, and no issue was open."; exit 0
+          fi
+          echo "$message"
+          echo "message=$message" >> "$GITHUB_OUTPUT"
+
+      - name: Post to Slack
+        if: steps.issue.outputs.message != ''
+        shell: bash
+        env:
+          MESSAGE: ${{ steps.issue.outputs.message }}
+          SLACK_WEBHOOK_URL: ${{ secrets.slack-webhook-url }}
+        run: |
+          [ -n "$SLACK_WEBHOOK_URL" ] || exit 0
+          # Slack reads <, > and & as markup. Keep the webhook out of argv.
+          if ! curl -sS --fail --max-time 20 -K <(printf 'url = "%s"\n' "$SLACK_WEBHOOK_URL") \
+            -H 'Content-Type: application/json' -o /dev/null \
+            --data "$(jq -cn --arg t "$MESSAGE" '{text: ($t | gsub("&"; "&amp;") | gsub("<"; "&lt;") | gsub(">"; "&gt;"))}')"; then
+            # The issue is the record; a Slack failure should not turn the run red.
+            echo "::warning::Slack notification failed"
+          fi
