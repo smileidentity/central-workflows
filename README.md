@@ -84,7 +84,7 @@ List every job in `needs`: a job left out cannot turn the report red. `failed` c
 
 The job only acts on `schedule` and `workflow_dispatch` runs of the default branch, so the same workflow can also run on pull requests. A manual run on another branch leaves the issue alone.
 
-It finds the issue by the label `red-lane:<workflow file name>`, cut to GitHub's 50-character limit, and adds the `team` label when it opens one. It creates both labels if they do not exist. Do not remove the `red-lane` label from an open issue, or the next failure opens a second one.
+It finds the issue by the label `red-lane:<workflow file name without extension>`, and adds the `team` label when it opens one. It creates both labels if they do not exist. A name too long for GitHub's 50-character limit is cut and ends in a short hash of the full name. Do not remove the `red-lane` label from an open issue, or the next failure opens a second one. If you rename the workflow file, close its open issue by hand.
 
 The caller job needs `issues: write`, which works even when the workflow sets tighter defaults. The workflow uses the calling repository's `GITHUB_TOKEN`. The Slack webhook is optional: leave out `secrets` to skip Slack. A Slack failure shows as a warning and does not fail the job.
 

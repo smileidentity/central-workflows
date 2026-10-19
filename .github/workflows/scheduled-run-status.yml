@@ -21,15 +21,15 @@ on:
 permissions:
   issues: write
 
-# Two runs of one workflow finishing together must not open two issues.
-concurrency:
-  group: scheduled-run-status-${{ github.repository }}-${{ github.workflow }}
-  cancel-in-progress: false
-
 jobs:
   report:
     # Push and pull request runs have their own checks; only unattended runs need an issue.
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    # Two runs of one workflow file finishing together must not open two issues. At job level,
+    # skipped runs never join the queue and push out a pending report.
+    concurrency:
+      group: scheduled-run-status-${{ github.workflow_ref }}
+      cancel-in-progress: false
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -44,14 +44,17 @@ jobs:
         run: |
           # A manual run on a branch is someone trying a fix, so it must not open or close the issue.
           default=$(gh api "repos/$GITHUB_REPOSITORY" --jq .default_branch)
-          if [ "$GITHUB_REF_NAME" != "$default" ]; then
-            echo "Ran on $GITHUB_REF_NAME, not $default, so the issue was left alone."; exit 0
+          # Compare the full ref, so a tag named after the default branch does not pass.
+          if [ "$GITHUB_REF" != "refs/heads/$default" ]; then
+            echo "Ran on $GITHUB_REF, not $default, so the issue was left alone."; exit 0
           fi
 
           # The github context here is the caller's, so this names the calling workflow file.
           file=${GITHUB_WORKFLOW_REF%@*}; file=${file##*/}
-          # GitHub labels are at most 50 characters.
-          label="red-lane:${file%.*}"; label=${label:0:50}
+          # GitHub labels are at most 50 characters. A long name keeps a hash of the full name,
+          # so two files that share a prefix still get their own label.
+          label="red-lane:${file%.*}"
+          [ ${#label} -le 50 ] || label="red-lane:${file:0:32}-$(printf %s "$file" | sha1sum | cut -c1-8)"
           run="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
           issue=$(gh issue list --label "$label" --state open --limit 1 --json number --jq '.[0].number // empty')
           url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/issues/$issue"
@@ -60,9 +63,9 @@ jobs:
             gh issue comment "$issue" --body "Failed again: $run" > /dev/null
             message="$GITHUB_REPOSITORY: $GITHUB_WORKFLOW failed again. Run: $run Issue: $url"
           elif [ "$FAILED" = true ]; then
-            # Creating a label that exists fails, which is fine. Any other problem fails the create below.
-            gh label create "$label" --color d73a4a --description "Open while the $file scheduled run fails" 2> /dev/null || true
-            gh label create "$TEAM" 2> /dev/null || true
+            gh label create "$label" --force --color d73a4a --description "Open while $label fails"
+            # The team label is shared, so leave it as it is. If it is bad, the create below fails.
+            gh label create "$TEAM" || true
             url=$(gh issue create --title "$GITHUB_WORKFLOW is failing" --label "$label" --label "$TEAM" \
               --body "The scheduled \`$file\` workflow failed: $run"$'\n\n'"Each failed run adds a comment here. The next passing run on \`$default\` closes this issue.")
             message="$GITHUB_REPOSITORY: $GITHUB_WORKFLOW failed. Run: $run Issue: $url"
@@ -75,7 +78,8 @@ jobs:
           echo "$message"
           echo "message=$message" >> "$GITHUB_OUTPUT"
 
-      - name: Post to Slack
+      - id: slack
+        name: Post to Slack
         if: steps.issue.outputs.message != ''
         shell: bash
         env:

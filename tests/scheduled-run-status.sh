@@ -8,7 +8,7 @@ workflow="$root/.github/workflows/scheduled-run-status.yml"
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 
-step() { yq ".jobs.report.steps[$1].run" "$workflow"; }
+step() { yq ".jobs.report.steps[] | select(.id == \"$1\") | .run" "$workflow"; }
 fail() { echo "FAIL: $*" >&2; exit 1; }
 
 # The fake gh records each call, one argument per line and a blank line after, and answers
@@ -40,10 +40,10 @@ chmod +x "$tmp/bin/gh" "$tmp/bin/curl"
 export PATH="$tmp/bin:$PATH" CALLS="$tmp/calls" GITHUB_OUTPUT="$tmp/output"
 export GITHUB_SERVER_URL=https://github.com GITHUB_REPOSITORY=smileidentity/example GITHUB_RUN_ID=42
 export GITHUB_WORKFLOW='Nightly API tests' GITHUB_WORKFLOW_REF=smileidentity/example/.github/workflows/nightly.yml@refs/heads/main
-export GITHUB_REF_NAME=main DEFAULT=main OPEN='' EXISTING='' TEAM=team:api
+export GITHUB_REF=refs/heads/main DEFAULT=main OPEN='' EXISTING='' TEAM=team:api
 run_url=https://github.com/smileidentity/example/actions/runs/42
 
-report() { (: > "$CALLS"; : > "$GITHUB_OUTPUT"; FAILED=$1 bash -eo pipefail -c "$(step 0)"); }
+report() { (: > "$CALLS"; : > "$GITHUB_OUTPUT"; FAILED=$1 bash -eo pipefail -c "$(step issue)"); }
 # Each gh call as one line, its arguments separated by |.
 calls() { awk 'BEGIN { RS = ""; FS = "\n" } { line = $1; for (i = 2; i <= NF; i++) line = line "|" $i; print line }' "$CALLS"; }
 message() { sed -n 's/^message=//p' "$GITHUB_OUTPUT"; }
@@ -55,7 +55,7 @@ message() { sed -n 's/^message=//p' "$GITHUB_OUTPUT"; }
 # First failure: create both labels and open an issue that carries them.
 report true > /dev/null
 calls | grep -q '^issue|list|--label|red-lane:nightly|--state|open|' || fail "did not look for the issue by its workflow label"
-calls | grep -q '^label|create|red-lane:nightly|' || fail "did not create the workflow label"
+calls | grep -q '^label|create|red-lane:nightly|--force|' || fail "did not create or update the workflow label"
 calls | grep -q '^label|create|team:api$' || fail "did not create the team label"
 calls | grep -q "^issue|create|--title|Nightly API tests is failing|--label|red-lane:nightly|--label|team:api|--body|The scheduled \`nightly.yml\` workflow failed: $run_url" \
   || fail "issue was not opened with both labels and the run link"
@@ -82,17 +82,27 @@ report false > /dev/null
 [ -z "$(message)" ] || fail "a quiet pass left a message"
 
 # A manual run on another branch neither opens nor closes the issue.
-GITHUB_REF_NAME=fix/flaky OPEN=7 report false > /dev/null
+GITHUB_REF=refs/heads/fix/flaky OPEN=7 report false > /dev/null
 [ "$(calls | grep -vc '^api|')" -eq 0 ] || fail "a run on a branch touched issues"
 
-# Long workflow file names still give a valid label.
-GITHUB_WORKFLOW_REF=smileidentity/example/.github/workflows/a-very-long-scheduled-workflow-file-name-for-testing.yaml@refs/heads/main report true > /dev/null
-label=$(calls | sed -n 's/^issue|list|--label|\([^|]*\)|.*/\1/p')
-[ "$label" = 'red-lane:a-very-long-scheduled-workflow-file-name-' ] || fail "long label is '$label'"
+# Nor does a manual run on a tag named after the default branch.
+GITHUB_REF=refs/tags/main OPEN=7 report false > /dev/null
+[ "$(calls | grep -vc '^api|')" -eq 0 ] || fail "a run on a tag named main touched issues"
+
+# Long workflow file names that share a prefix still get valid labels of their own.
+long_label() {
+  GITHUB_WORKFLOW_REF="smileidentity/example/.github/workflows/$1@refs/heads/main" report true > /dev/null
+  calls | sed -n 's/^issue|list|--label|\([^|]*\)|.*/\1/p'
+}
+europe=$(long_label nightly-integration-tests-for-production-europe.yml)
+us=$(long_label nightly-integration-tests-for-production-us.yml)
+[ ${#europe} -le 50 ] && [ ${#us} -le 50 ] || fail "long labels are over 50 characters: '$europe', '$us'"
+[ "$europe" != "$us" ] || fail "two long names share the label '$us'"
+[ "${us:0:41}" = 'red-lane:nightly-integration-tests-for-pr' ] || fail "long label lost its readable prefix: '$us'"
 
 # Slack: skipped without a webhook, escaped with one, and a failure only warns.
-yq '.jobs.report.steps[1].if' "$workflow" | grep -q "steps.issue.outputs.message != ''" || fail "Slack runs without a message"
-slack() { (rm -f "$CALLS.slack"; MESSAGE='a <b> & c' bash -eo pipefail -c "$(step 1)"); }
+yq '.jobs.report.steps[] | select(.id == "slack") | .if' "$workflow" | grep -q "steps.issue.outputs.message != ''" || fail "Slack runs without a message"
+slack() { (rm -f "$CALLS.slack"; MESSAGE='a <b> & c' bash -eo pipefail -c "$(step slack)"); }
 SLACK_WEBHOOK_URL='' slack > /dev/null
 [ ! -e "$CALLS.slack" ] || fail "Slack was called without a webhook"
 SLACK_WEBHOOK_URL=https://hooks.slack.com/services/x slack > /dev/null
