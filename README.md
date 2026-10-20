@@ -5,6 +5,7 @@ Shared GitHub Actions workflows for Smile Identity's public and private reposito
 - `auto-author-assign.yml` adds the PR author as an assignee when a PR opens or reopens. It skips bot authors and keeps existing assignees.
 - `stale.yml` labels PRs after 14 days without activity and removes the label when activity resumes. It does not mark issues or close issues or PRs.
 - `deploy-status.yml` records what each environment is running. After a deploy it updates a badge for that environment on the calling repository's `deploy-status` branch and, if given a Slack token and canvas, that environment's line on a shared Slack canvas.
+- `scheduled-run-status.yml` keeps one issue open while a scheduled workflow fails. A failed run opens the issue or comments on it, and the next passing run closes it. Given a Slack webhook, it posts each change to Slack too.
 
 `Check shared PR workflows` calls the released workflows in this repository too. It assigns PR authors and supports manual dry runs of stale handling.
 
@@ -61,6 +62,32 @@ The image only loads for people who can read the repository, and only on github.
 
 The Slack step needs a bot token with the `canvases:read` and `canvases:write` scopes, and the bot needs edit access to the canvas. Each environment gets one line under a heading for its repository. The workflow adds the heading and the line on the first deploy and replaces the line after that. A Slack failure shows as a warning and does not fail the job.
 
+## Report scheduled run status
+
+Add a job at the end of the scheduled workflow that needs every other job:
+
+```yaml
+  report:
+    needs: [build, test]
+    if: ${{ !cancelled() }}
+    permissions:
+      issues: write
+    uses: smileidentity/central-workflows/.github/workflows/scheduled-run-status.yml@v1
+    with:
+      failed: ${{ contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') }}
+      team: team:api
+    secrets:
+      slack-webhook-url: ${{ secrets.NIGHTLY_SLACK_WEBHOOK_URL }}
+```
+
+List every job in `needs`: a job left out cannot turn the report red. `failed` counts cancelled jobs as well as failed ones, so a job that stops part-way still opens an issue. `!cancelled()` skips the report when someone cancels the whole run.
+
+The job only acts on `schedule` and `workflow_dispatch` runs of the default branch, so the same workflow can also run on pull requests. A manual run on another branch leaves the issue alone.
+
+It finds the issue by the label `red-lane:<workflow file name without extension>`, and adds the `team` label when it opens one. It creates both labels if they do not exist. A name too long for GitHub's 50-character limit is cut and ends in a short hash of the full name. Do not remove the `red-lane` label from an open issue, or the next failure opens a second one. If you rename the workflow file, close its open issue by hand.
+
+The caller job needs `issues: write`, which works even when the workflow sets tighter defaults. The workflow uses the calling repository's `GITHUB_TOKEN`. The Slack webhook is optional: leave out `secrets` to skip Slack. A Slack failure shows as a warning and does not fail the job.
+
 ## Releases
 
 
@@ -71,4 +98,4 @@ Third-party actions are pinned to commit SHAs. Keep this public repository free 
 
 ## Check changes
 
-Run `actionlint .github/workflows/*.yml` and `tests/deploy-status.sh` (needs `yq` and `xmllint`). Test author assignment with a PR and run the stale workflow manually with `dry-run` enabled before advancing `v1`.
+Run `actionlint .github/workflows/*.yml`, `tests/deploy-status.sh` (needs `yq` and `xmllint`) and `tests/scheduled-run-status.sh` (needs `yq` and `jq`). Test author assignment with a PR and run the stale workflow manually with `dry-run` enabled before advancing `v1`.
