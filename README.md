@@ -6,7 +6,7 @@ Shared GitHub Actions workflows for Smile Identity's public and private reposito
 - `stale.yml` labels PRs after 14 days without activity and removes the label when activity resumes. It does not mark issues or close issues or PRs.
 - `deploy-status.yml` records what each environment is running. After a deploy it updates a badge for that environment on the calling repository's `deploy-status` branch and, if given a Slack token and canvas, that environment's line on a shared Slack canvas.
 
-`Check shared PR workflows` calls the released workflows in this repository too. It assigns PR authors and supports manual dry runs of stale handling.
+`Check shared PR workflows` calls this repository's workflows too, pinned by commit SHA like any other caller. Update its pins when you update the distributed callers. It assigns PR authors and supports manual dry runs of stale handling.
 
 ## Use the workflows
 
@@ -15,13 +15,13 @@ Each consuming repository needs a caller in `.github/workflows/` with its own ev
 ```yaml
 jobs:
   assign:
-    uses: smileidentity/central-workflows/.github/workflows/auto-author-assign.yml@v1
+    uses: smileidentity/central-workflows/.github/workflows/auto-author-assign.yml@<full commit SHA from main>
 ```
 
 ```yaml
 jobs:
   stale:
-    uses: smileidentity/central-workflows/.github/workflows/stale.yml@v1
+    uses: smileidentity/central-workflows/.github/workflows/stale.yml@<full commit SHA from main>
 ```
 
 The author caller needs `pull-requests: write`. The stale caller needs `issues: write` and `pull-requests: write`. No shared secrets are required: each workflow uses the calling repository's `GITHUB_TOKEN`.
@@ -39,7 +39,7 @@ Add a job after the deploy job, so it runs only when the deploy succeeds:
     needs: deploy
     permissions:
       contents: write
-    uses: smileidentity/central-workflows/.github/workflows/deploy-status.yml@v1
+    uses: smileidentity/central-workflows/.github/workflows/deploy-status.yml@<full commit SHA from main>
     with:
       environment: production
       ref: ${{ github.ref_name }}
@@ -63,12 +63,10 @@ The Slack step needs a bot token with the `canvases:read` and `canvases:write` s
 
 ## Releases
 
+Callers pin each workflow to a full commit SHA from `main`, as we do for third-party actions. A change reaches a caller only when its SHA is updated. The internal distribution job updates the author and stale callers; deploy-status callers are updated by a PR in each repository. The `v1` branch is no longer updated.
 
-
-`v1` is the maintained release branch. Update it to a tested commit from `main` for backwards-compatible fixes. Callers receive those fixes without a rollout PR. Changes to caller events, schedules or permissions need a new distribution PR.
-
-Third-party actions are pinned to commit SHAs. Keep this public repository free of credentials and private configuration.
+Third-party actions inside these workflows are pinned to commit SHAs too. Keep this public repository free of credentials and private configuration.
 
 ## Check changes
 
-Run `actionlint .github/workflows/*.yml` and `tests/deploy-status.sh` (needs `yq` and `xmllint`). Test author assignment with a PR and run the stale workflow manually with `dry-run` enabled before advancing `v1`.
+Run `actionlint .github/workflows/*.yml` and `tests/deploy-status.sh` (needs `yq` and `xmllint`). Before updating callers to a new commit, test it here. On a branch, change the pins in `pr-hygiene.yml` to that commit and run `Check shared PR workflows` manually from that branch with `dry-run` enabled. Author assignment uses `pull_request_target`, so it runs from `main`: merge the pin change, then open a PR to check it.
