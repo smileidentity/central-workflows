@@ -19,9 +19,9 @@ permissions:
 jobs:
   assign:
     if: github.event_name == 'pull_request_target'
-    uses: smileidentity/central-workflows/.github/workflows/auto-author-assign.yml@v1
+    uses: smileidentity/central-workflows/.github/workflows/auto-author-assign.yml@e04941c6757ab31f0e5de5195a264530e8c373d0 # update with the distributed callers
   stale:
     if: github.event_name != 'pull_request_target'
-    uses: smileidentity/central-workflows/.github/workflows/stale.yml@v1
+    uses: smileidentity/central-workflows/.github/workflows/stale.yml@e04941c6757ab31f0e5de5195a264530e8c373d0 # update with the distributed callers
     with:
       dry-run: ${{ inputs.dry-run || false }}
