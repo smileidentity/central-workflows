@@ -1,0 +1,45 @@
+name: Check workflows
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install actionlint
+        env:
+          ACTIONLINT_VERSION: 1.7.12
+          ACTIONLINT_SHA256: 8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8
+        run: |
+          archive="actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz"
+          curl -fsSL -o "$RUNNER_TEMP/$archive" \
+            "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/$archive"
+          echo "$ACTIONLINT_SHA256  $RUNNER_TEMP/$archive" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/$archive" -C "$RUNNER_TEMP" actionlint
+
+      - name: Lint workflows and scripts
+        run: |
+          "$RUNNER_TEMP/actionlint" .github/workflows/*.yml
+          shellcheck scripts/spec_sync/*.sh tests/spec-sync-state.sh
+
+      - name: Test the spec-sync scripts
+        run: |
+          git config --global init.defaultBranch main
+          python3 -m unittest discover -s tests -v
+          bash tests/spec-sync-state.sh
+
+      - name: Test the deploy-status workflow
+        run: |
+          command -v xmllint > /dev/null || { sudo apt-get update -q && sudo apt-get install -yq libxml2-utils; }
+          bash tests/deploy-status.sh

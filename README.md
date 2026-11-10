@@ -5,6 +5,7 @@ Shared GitHub Actions workflows for Smile Identity's public and private reposito
 - `auto-author-assign.yml` adds the PR author as an assignee when a PR opens or reopens. It skips bot authors and keeps existing assignees.
 - `stale.yml` labels PRs after 14 days without activity and removes the label when activity resumes. It does not mark issues or close issues or PRs.
 - `deploy-status.yml` records what each environment is running. After a deploy it updates a badge for that environment on the calling repository's `deploy-status` branch and, if given a Slack token and canvas, that environment's line on a shared Slack canvas.
+- `sdk-spec-sync-record.yml` and `sdk-spec-sync.yml` keep the V3 server-side SDKs in step with the API spec. They run in this repository only; nothing calls them. See [Sync the SDKs with the API spec](#sync-the-sdks-with-the-api-spec).
 
 `Check shared PR workflows` calls this repository's workflows too, pinned by commit SHA like any other caller. Update its pins when you update the distributed callers. It assigns PR authors and supports manual dry runs of stale handling.
 
@@ -61,6 +62,27 @@ The image only loads for people who can read the repository, and only on github.
 
 The Slack step needs a bot token with the `canvases:read` and `canvases:write` scopes, and the bot needs edit access to the canvas. Each environment gets one line under a heading for its repository. The workflow adds the heading and the line on the first deploy and replaces the line after that. A Slack failure shows as a warning and does not fail the job.
 
+## Sync the SDKs with the API spec
+
+When a lambda release changes the SDK spec, lambda sends a `sdk-spec-changed` repository dispatch here with the tag, the tag it was compared with, an `oasdiff` change summary, whether the change is breaking, and the lambda PR numbers.
+
+1. `sdk-spec-sync-record.yml` checks the payload and stores it as `state/pending/<tag>.json` on the `spec-sync-state` branch. It does nothing else, so many releases in a day cause no noise in the SDKs.
+2. `sdk-spec-sync.yml` runs at 06:00 UTC each day. It runs one job per repository: the seven `smileid-sdk-*` SDKs and `smileid-sdk-fixtures`. Each job gives Claude (`anthropics/claude-code-action`) the repository's `AGENTS.md`, the public spec `api-reference/specs/v3/openapi.yaml` at the old and new tags, the change summaries and the lambda PR descriptions. Claude makes the change with tests, golden fixtures and coverage, and runs the repository's checks. The prompt is `scripts/spec_sync/prompt.md`.
+3. The job then checks the change (no edits under `.github/`, no coverage exclusions, no conflict markers), commits it as `SMILE_GHA_BOT` and updates the repository's open `spec-sync/rolling` PR, or opens one as a draft labelled `spec-sync`. Each breaking release gets its own draft PR on `spec-sync/breaking-<tag>`, also labelled `breaking`. Each run rewrites the PR description; it never comments.
+4. When every job succeeds, the records move to `state/processed/`. If any job fails, they stay pending and the next run tries again.
+5. Every hour, the workflow marks draft spec-sync PRs ready for review once all their checks pass and Claude reported no gaps. It also rewrites the pinned "SDK spec sync status" issue, which shows each repository's open spec-sync PRs, spec tag and last run result.
+
+Claude has no write token: it edits the working tree and the workflow publishes. Its output is not printed, because this repository's logs are public. Lambda PR descriptions are read on the runner and never published.
+
+To clear a backlog, run `SDK spec sync` by hand with `from_tag` set to the spec tag the SDKs already match. Add `scope`, such as `AML operations`, to open a separate `spec-sync/<scope>` PR for one part of the spec. Use `repos`, such as `go`, to try one repository; pending records then stay pending.
+
+The workflows need these secrets. Until they exist, the daily run skips with a warning and records stay pending.
+
+- `ANTHROPIC_API_KEY`
+- `SMILE_GHA_BOT_CLIENT_ID` and `SMILE_GHA_BOT_PRIVATE_KEY`, already set for the organisation. The app needs contents, pull requests and issues write access on the SDK and fixtures repositories, checks and statuses read access, and pull requests read access on lambda.
+
+Set the optional `SDK_SPEC_SYNC_MODEL` variable to choose the Claude model.
+
 ## Releases
 
 Callers pin each workflow to a full commit SHA from `main`, as we do for third-party actions. A change reaches a caller only when its SHA is updated. The internal distribution job updates the author and stale callers; deploy-status callers are updated by a PR in each repository. The `v1` branch is no longer updated.
@@ -69,4 +91,4 @@ Third-party actions inside these workflows are pinned to commit SHAs too. Keep t
 
 ## Check changes
 
-Run `actionlint .github/workflows/*.yml` and `tests/deploy-status.sh` (needs `yq` and `xmllint`). Before updating callers to a new commit, test it here. On a branch, change the pins in `pr-hygiene.yml` to that commit and run `Check shared PR workflows` manually from that branch with `dry-run` enabled. Author assignment uses `pull_request_target`, so it runs from `main`: merge the pin change, then open a PR to check it.
+Run `actionlint .github/workflows/*.yml`, `tests/deploy-status.sh` (needs `yq` and `xmllint`), `python3 -m unittest discover -s tests` and `tests/spec-sync-state.sh`. The `Check workflows` workflow runs them on every PR. Before updating callers to a new commit, test it here. On a branch, change the pins in `pr-hygiene.yml` to that commit and run `Check shared PR workflows` manually from that branch with `dry-run` enabled. Author assignment uses `pull_request_target`, so it runs from `main`: merge the pin change, then open a PR to check it.
