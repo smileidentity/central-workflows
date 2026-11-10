@@ -62,6 +62,9 @@ check code-under-docs code octocat web/src/components/docs/sdk.tsx
 check openapi-under-docs code octocat docs/openapi/v3.yaml
 check test-named-main-source code octocat testing/src/main/java/com/example/testing/ExampleTest.kt
 check spec-yaml code octocat api/openapi.spec.yaml
+check mdx code octocat pages/quickstart.mdx
+check pytest-files tests-only octocat test_cli.py pkg/test_utils.py
+check test-prefixed-dir code octocat app/test_mode/live_handler.py
 check code code octocat src/index.ts README.md
 check rename-out-of-code code octocat $'docs/old.ts\tsrc/old.ts'
 check human-lockfile code octocat package-lock.json

@@ -33,7 +33,9 @@ jobs:
           gh api --paginate "repos/$REPO/pulls/$PR/commits" \
             --jq '.[] | {login: (.author.login // ""), committer: (.committer.login // ""), verified: .commit.verification.verified, message: .commit.message}' > commits.jsonl
 
+      # A failure here must not fail the job: the label step then skips and the job still passes.
       - id: classify
+        continue-on-error: true
         env:
           FETCH: ${{ steps.fetch.outcome }}
           AUTHOR: ${{ github.event.pull_request.user.login }}
@@ -67,16 +69,18 @@ jobs:
               src/main/* | */src/main/* | Sources/* | */Sources/*) echo other ;;
               test/* | */test/* | tests/* | */tests/* | __tests__/* | */__tests__/* | __snapshots__/* | */__snapshots__/* | \
               testdata/* | */testdata/* | fixtures/* | */fixtures/* | e2e/* | */e2e/* | cypress/* | */cypress/* | \
-              spec/*.rb | */spec/*.rb | *Tests/* | */androidTest/* | *_test.go | *_test.py | test_*.py | */test_*.py | \
+              spec/*.rb | */spec/*.rb | *Tests/* | */androidTest/* | *_test.go | *_test.py | \
               conftest.py | */conftest.py | *_spec.rb | *Test.kt | *Test.java | *Test.swift | *Tests.swift | \
               *.test.[jt]s | *.test.[jt]sx | *.test.[cm][jt]s | *.spec.[jt]s | *.spec.[jt]sx | *.spec.[cm][jt]s)
                 echo test ;;
+              # MDX is not here: it can import and run components when the site builds.
               # Only prose and top-level doc images: code, specs and assets under a nested docs/ can ship.
-              *.md | *.mdx | *.rst | *.adoc | LICENSE | LICENSE.* | */LICENSE | .gitbook/assets/* | \
+              *.md | *.rst | *.adoc | LICENSE | LICENSE.* | */LICENSE | .gitbook/assets/* | \
               docs/*.png | docs/*.jpg | docs/*.jpeg | docs/*.gif | docs/*.svg | docs/*.webp | \
               doc/*.png | doc/*.jpg | doc/*.jpeg | doc/*.gif | doc/*.svg | doc/*.webp)
                 echo docs ;;
-              *) echo other ;;
+              # Matched on the file name alone, because * in a case pattern also crosses directories.
+              *) if [[ ${1##*/} == test_*.py ]]; then echo test; else echo other; fi ;;
             esac
           }
 
@@ -178,7 +182,7 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
       # Fork PRs get a read-only token, so they get the summary but no label.
-      - if: github.event.pull_request.head.repo.full_name == github.repository
+      - if: steps.classify.outputs.class != '' && github.event.pull_request.head.repo.full_name == github.repository
         continue-on-error: true
         env:
           GH_TOKEN: ${{ github.token }}

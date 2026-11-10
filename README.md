@@ -75,7 +75,7 @@ It reads the PR's file list and commits through the API and never checks out PR 
 | `deps-patch`, `deps-minor` | Dependabot opened it, every commit is authored by Dependabot and signed by GitHub, and it changes only manifests, lockfiles and workflow pins. The class is the largest update type |
 | `deps-major` | As above, with a major update or an update with no stated type, such as a bump to a commit SHA |
 | `ci-config` | It changes `.github/`, other CI files or CODEOWNERS, plus at most tests and documentation |
-| `code` | Anything else, including dependency changes by a person, instructions for coding agents such as `AGENTS.md` or `.github/copilot-instructions.md`, and code under `docs/` |
+| `code` | Anything else, including dependency changes by a person, instructions for coding agents such as `AGENTS.md` or `.github/copilot-instructions.md`, MDX, which can run code when a docs site builds, and code under `docs/` |
 | `unknown` | The file list could not be read in full |
 
 A file that is renamed counts under its old and new paths, so moving code into `docs/` is still a code change. Fork PRs get the summary but no label, because their token is read-only.
