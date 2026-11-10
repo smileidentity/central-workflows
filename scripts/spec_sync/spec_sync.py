@@ -706,7 +706,8 @@ def publish(*, u, workdir, bundle, out, state_dir, write_token, bot_name, bot_em
     code, _, _ = git(["merge-base", "--is-ancestor", default_sha, "HEAD"], workdir, check=False)
     merging = code != 0
     if merging:
-        git(["merge", "--quiet", "--no-commit", "-s", "ours", default_sha], workdir)
+        git(["-c", f"user.name={bot_name}", "-c", f"user.email={bot_email}",
+             "merge", "--quiet", "--no-commit", "-s", "ours", default_sha], workdir)
 
     # The patch also carries the default branch's merged-in changes, so the
     # guards run after applying it, on the result compared with that branch.
