@@ -1,0 +1,180 @@
+name: Merge safety
+
+# Sorts each PR into one risk class from its changed files and author, and shows the
+# class as a label, an annotation and a job summary. It is advisory and always passes,
+# so a wrong or failed classification never blocks a merge. Every repository gets it
+# through an org ruleset "require workflow" rule, so it must only ever trigger on PRs.
+on:
+  pull_request:
+
+permissions:
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: merge-safety-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  merge-safety:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      # Reads PR metadata through the API only. Never check out or run PR code here.
+      - id: fetch
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          gh api --paginate "repos/$REPO/pulls/$PR/files" \
+            --jq '.[] | [.filename, (.previous_filename // "")] | @tsv' > files.tsv
+          gh api --paginate "repos/$REPO/pulls/$PR/commits" \
+            --jq '.[] | {login: (.author.login // ""), verified: .commit.verification.verified, message: .commit.message}' > commits.jsonl
+
+      - id: classify
+        env:
+          FETCH: ${{ steps.fetch.outcome }}
+          AUTHOR: ${{ github.event.pull_request.user.login }}
+          CHANGED_FILES: ${{ github.event.pull_request.changed_files }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          RULES: ${{ github.workflow_ref }} (${{ github.workflow_sha }})
+        run: |
+          kind() {
+            case "${1##*/}" in
+              package.json | package-lock.json | npm-shrinkwrap.json | yarn.lock | pnpm-lock.yaml | bun.lock | bun.lockb | \
+              Gemfile | Gemfile.lock | *.gemspec | requirements*.txt | pyproject.toml | poetry.lock | uv.lock | Pipfile | Pipfile.lock | \
+              go.mod | go.sum | *.gradle | *.gradle.kts | libs.versions.toml | gradle-wrapper.properties | Podfile | Podfile.lock | \
+              Package.swift | Package.resolved | Cargo.toml | Cargo.lock | composer.json | composer.lock | pubspec.yaml | pubspec.lock | \
+              Dockerfile* | *.tf | .terraform.lock.hcl | *.csproj | packages.lock.json)
+                echo deps; return ;;
+            esac
+            # In case patterns * also matches /, so */x/* matches x/ at any depth below the root.
+            case "$1" in
+              .github/*.md | .github/ISSUE_TEMPLATE/*) echo docs ;;
+              .github/* | .circleci/* | .buildkite/* | .gitlab-ci.yml | Jenkinsfile | bitrise.yml | codemagic.yaml | \
+              CODEOWNERS | docs/CODEOWNERS | .pre-commit-config.yaml | action.yml | action.yaml | */action.yml | */action.yaml)
+                echo ci ;;
+              # Instructions that steer coding agents change behaviour, so they are not docs.
+              AGENTS.md | */AGENTS.md | CLAUDE.md | */CLAUDE.md | SKILL.md | */SKILL.md | *.prompt.md | \
+              .claude/* | */.claude/* | .cursor/* | */.cursor/* | prompts/* | */prompts/*)
+                echo other ;;
+              test/* | */test/* | tests/* | */tests/* | __tests__/* | */__tests__/* | __snapshots__/* | */__snapshots__/* | \
+              testdata/* | */testdata/* | fixtures/* | */fixtures/* | e2e/* | */e2e/* | cypress/* | */cypress/* | \
+              spec/*.rb | */spec/*.rb | *Tests/* | */androidTest/* | *.test.* | *.spec.* | *_test.go | *_test.py | \
+              test_*.py | */test_*.py | conftest.py | */conftest.py | *_spec.rb | *Test.kt | *Test.java | *Test.swift | *Tests.swift)
+                echo test ;;
+              *.md | *.mdx | *.rst | *.adoc | docs/* | */docs/* | doc/* | */doc/* | LICENSE | LICENSE.* | */LICENSE)
+                echo docs ;;
+              *) echo other ;;
+            esac
+          }
+
+          reasons=()
+          rows=()
+          kinds=" "
+          dependabot_files=yes
+          total=0
+          if [[ $FETCH == success ]]; then
+            while IFS=$'\t' read -r path previous; do
+              total=$((total + 1))
+              for p in "$path" ${previous:+"$previous"}; do
+                k=$(kind "$p")
+                kinds+="$k "
+                if [[ $p == "$previous" ]]; then rows+=("| \`$p\` (old name) | $k |"); else rows+=("| \`$p\` | $k |"); fi
+                if [[ $k != deps && $p != .github/workflows/* && $p != action.y*ml && $p != */action.y*ml ]]; then
+                  dependabot_files=no
+                fi
+              done
+            done < files.tsv
+          fi
+
+          has() { [[ $kinds == *" $1 "* ]]; }
+          only() {
+            local k
+            for k in deps ci other test docs; do
+              [[ " $* " == *" $k "* ]] || ! has "$k" || return 1
+            done
+          }
+
+          if [[ $FETCH != success ]]; then
+            class=unknown; reasons+=("Could not read the PR's files or commits from the API.")
+          elif [[ $total -eq 0 ]]; then
+            class=unknown; reasons+=("The PR has no changed files.")
+          elif [[ $total -ne $CHANGED_FILES ]]; then
+            class=unknown; reasons+=("Read $total of $CHANGED_FILES changed files. The API lists at most 3,000.")
+          elif [[ $AUTHOR == 'dependabot[bot]' ]]; then
+            if [[ $(jq -s 'length > 0 and all(.login == "dependabot[bot]" and .verified)' commits.jsonl) != true ]]; then
+              class=code; reasons+=("Dependabot opened it, but not every commit is a signed Dependabot commit.")
+            elif [[ $dependabot_files != yes ]]; then
+              class=code; reasons+=("Dependabot opened it, but it changes files other than dependency manifests, lockfiles and workflow pins.")
+            else
+              types=$(jq -r .message commits.jsonl | sed -n 's/.*update-type: version-update:semver-\([a-z]*\).*/\1/p' | sort -u)
+              if [[ $types == *major* || -z $types ]]; then
+                class=deps-major
+                if [[ -z $types ]]; then reasons+=("Dependabot commits do not state an update type."); else reasons+=("Includes a major version update."); fi
+              elif [[ $types == *minor* ]]; then
+                class=deps-minor; reasons+=("Largest update is a minor version.")
+              else
+                class=deps-patch; reasons+=("Every update is a patch version.")
+              fi
+            fi
+          elif only docs; then
+            class=docs-only; reasons+=("Every changed file is documentation.")
+          elif only docs test; then
+            class=tests-only; reasons+=("Every changed file is a test, fixture or documentation.")
+          elif only docs test ci; then
+            class=ci-config; reasons+=("Changes CI or repository settings, and no application code.")
+          else
+            class=code
+            if has deps; then reasons+=("Changes dependency manifests or lockfiles."); fi
+            if has other; then reasons+=("Changes application code or other files."); fi
+          fi
+
+          case $class in
+            docs-only) headline="Docs only. Low risk." ;;
+            tests-only) headline="Tests only. Low risk if CI passes." ;;
+            deps-patch) headline="Dependabot patch update. Low risk if CI passes." ;;
+            deps-minor) headline="Dependabot minor update. Low risk if CI passes." ;;
+            deps-major) headline="Dependabot major or unrecognised update. Check the changelog for breaking changes." ;;
+            ci-config) headline="CI or repository settings. Review what runs and which secrets it can read." ;;
+            code) headline="Code change. Needs a full review." ;;
+            unknown) headline="Could not classify this PR. Needs a full review." ;;
+          esac
+
+          echo "class=$class" >> "$GITHUB_OUTPUT"
+          echo "::notice title=Merge safety: $class::$headline"
+          {
+            echo "## Merge safety: $class"
+            echo
+            echo "$headline"
+            echo
+            printf -- '- %s\n' "${reasons[@]}"
+            echo "- Author: \`$AUTHOR\`. Commit checked: \`$HEAD_SHA\`. Rules: \`$RULES\`."
+            echo
+            echo "This is advisory. It never blocks a merge, and it approves nothing."
+            if [[ ${#rows[@]} -gt 0 ]]; then
+              echo
+              echo "| File | Kind |"
+              echo "|---|---|"
+              printf '%s\n' "${rows[@]:0:200}"
+              if [[ ${#rows[@]} -gt 200 ]]; then echo; echo "${#rows[@]} files in all; the first 200 are shown."; fi
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # Fork PRs get a read-only token, so they get the summary but no label.
+      - if: github.event.pull_request.head.repo.full_name == github.repository
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+          LABEL: merge-safety/${{ steps.classify.outputs.class }}
+        run: |
+          gh api "repos/$REPO/issues/$PR/labels" \
+            --jq '.[].name | select(startswith("merge-safety/")) | @uri' |
+            while read -r old; do
+              [[ $old == "${LABEL/\//%2F}" ]] || gh api -X DELETE "repos/$REPO/issues/$PR/labels/$old" --silent
+            done
+          gh api "repos/$REPO/issues/$PR/labels" -f "labels[]=$LABEL" --silent
