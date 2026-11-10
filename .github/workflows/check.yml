@@ -1,15 +1,16 @@
 name: Check workflows
 
+# Pushes to this repository's branches run the checks; pull requests run them only from forks.
 on:
-  pull_request:
   push:
-    branches: [main]
+  pull_request:
 
 permissions:
   contents: read
 
 jobs:
   check:
+    if: github.event_name == 'push' || github.event.pull_request.head.repo.fork
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
