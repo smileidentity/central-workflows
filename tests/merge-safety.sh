@@ -33,7 +33,7 @@ check() {
   local got
   got=$(cd "$dir" && : > out && : > summary &&
     FETCH=${FETCH:-success} AUTHOR=$author CHANGED_FILES=${CHANGED:-$#} HEAD_SHA=abc RULES=test \
-    GITHUB_OUTPUT=out GITHUB_STEP_SUMMARY=summary bash -eo pipefail -c "$script" > /dev/null &&
+    GITHUB_OUTPUT=out GITHUB_STEP_SUMMARY=summary bash -e -c "$script" > /dev/null &&
     sed -n 's/^class=//p' out)
   if [[ $got == "$want" ]]; then echo "ok   $name: $got"; else echo "FAIL $name: got '$got', want '$want'" >&2; failed=1; fi
 }
@@ -48,6 +48,16 @@ check ci ci-config octocat .github/workflows/ci.yml README.md tests/a_test.go
 check codeowners ci-config octocat .github/CODEOWNERS
 check agent-instructions code octocat AGENTS.md
 check skill code octocat skills/triage/SKILL.md
+check copilot-instructions code octocat .github/copilot-instructions.md
+check github-prompts code octocat .github/prompts/review.prompt.md .github/agents/reviewer.agent.md
+check agents-dir code octocat .agents/skills/write-docs/references/markdown.md
+check gemini code octocat GEMINI.md
+check workflow-markdown ci-config octocat .github/workflows/triage.md
+check gitbook-assets docs-only octocat .gitbook/assets/flow.png SUMMARY.md
+check code-under-docs code octocat frontend/src/components/reusable/docs/sdk.tsx
+check openapi-under-docs code octocat docs/openapi/v3.yaml
+check test-named-main-source code octocat usesmileid-testing/src/main/java/com/usesmileid/testing/UseSmileIDTest.kt
+check spec-yaml code octocat api/openapi.spec.yaml
 check code code octocat src/index.ts README.md
 check rename-out-of-code code octocat $'docs/old.ts\tsrc/old.ts'
 check human-lockfile code octocat package-lock.json
@@ -74,6 +84,15 @@ check dep-actions deps-minor 'dependabot[bot]' .github/workflows/ci.yml .github/
 
 mkdir -p "$tmp/dep-unsigned" && dependabot "$tmp/dep-unsigned" "$patch" false
 check dep-unsigned code 'dependabot[bot]' package.json
+
+mkdir -p "$tmp/dep-sha-bump" && dependabot "$tmp/dep-sha-bump" "updated-dependencies:
+- dependency-name: Swatinem/rust-cache
+  dependency-version: c8037a86
+$patch"
+check dep-sha-bump deps-major 'dependabot[bot]' .github/workflows/ci.yml
+
+mkdir -p "$tmp/dep-spoofed-author" && dependabot "$tmp/dep-spoofed-author" "$patch" true octocat
+check dep-spoofed-author code 'dependabot[bot]' package.json
 
 mkdir -p "$tmp/dep-human-commit" && dependabot "$tmp/dep-human-commit" "$patch" && human "$tmp/dep-human-commit"
 check dep-human-commit code 'dependabot[bot]' package.json

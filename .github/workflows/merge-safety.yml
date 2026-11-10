@@ -12,8 +12,8 @@ permissions:
   pull-requests: write
 
 concurrency:
+  # Queue rather than cancel: GitHub says ruleset workflows must not use cancel-in-progress.
   group: merge-safety-${{ github.event.pull_request.number }}
-  cancel-in-progress: true
 
 jobs:
   merge-safety:
@@ -31,7 +31,7 @@ jobs:
           gh api --paginate "repos/$REPO/pulls/$PR/files" \
             --jq '.[] | [.filename, (.previous_filename // "")] | @tsv' > files.tsv
           gh api --paginate "repos/$REPO/pulls/$PR/commits" \
-            --jq '.[] | {login: (.author.login // ""), verified: .commit.verification.verified, message: .commit.message}' > commits.jsonl
+            --jq '.[] | {login: (.author.login // ""), committer: (.committer.login // ""), verified: .commit.verification.verified, message: .commit.message}' > commits.jsonl
 
       - id: classify
         env:
@@ -52,20 +52,29 @@ jobs:
             esac
             # In case patterns * also matches /, so */x/* matches x/ at any depth below the root.
             case "$1" in
+              # Instructions that steer coding agents change behaviour, so they are not docs.
+              AGENTS.md | */AGENTS.md | CLAUDE.md | */CLAUDE.md | GEMINI.md | */GEMINI.md | SKILL.md | */SKILL.md | \
+              *.prompt.md | *.agent.md | *.instructions.md | */copilot-instructions.md | \
+              .claude/* | */.claude/* | .cursor/* | */.cursor/* | .agents/* | */.agents/* | .windsurf/* | */.windsurf/* | \
+              prompts/* | */prompts/* | .github/agents/* | .github/instructions/*)
+                echo other ;;
+              .github/workflows/*) echo ci ;;
               .github/*.md | .github/ISSUE_TEMPLATE/*) echo docs ;;
               .github/* | .circleci/* | .buildkite/* | .gitlab-ci.yml | Jenkinsfile | bitrise.yml | codemagic.yaml | \
               CODEOWNERS | docs/CODEOWNERS | .pre-commit-config.yaml | action.yml | action.yaml | */action.yml | */action.yaml)
                 echo ci ;;
-              # Instructions that steer coding agents change behaviour, so they are not docs.
-              AGENTS.md | */AGENTS.md | CLAUDE.md | */CLAUDE.md | SKILL.md | */SKILL.md | *.prompt.md | \
-              .claude/* | */.claude/* | .cursor/* | */.cursor/* | prompts/* | */prompts/*)
-                echo other ;;
+              # Shipped source sets, even when a file or package name contains "test".
+              src/main/* | */src/main/* | Sources/* | */Sources/*) echo other ;;
               test/* | */test/* | tests/* | */tests/* | __tests__/* | */__tests__/* | __snapshots__/* | */__snapshots__/* | \
               testdata/* | */testdata/* | fixtures/* | */fixtures/* | e2e/* | */e2e/* | cypress/* | */cypress/* | \
-              spec/*.rb | */spec/*.rb | *Tests/* | */androidTest/* | *.test.* | *.spec.* | *_test.go | *_test.py | \
-              test_*.py | */test_*.py | conftest.py | */conftest.py | *_spec.rb | *Test.kt | *Test.java | *Test.swift | *Tests.swift)
+              spec/*.rb | */spec/*.rb | *Tests/* | */androidTest/* | *_test.go | *_test.py | test_*.py | */test_*.py | \
+              conftest.py | */conftest.py | *_spec.rb | *Test.kt | *Test.java | *Test.swift | *Tests.swift | \
+              *.test.[jt]s | *.test.[jt]sx | *.test.[cm][jt]s | *.spec.[jt]s | *.spec.[jt]sx | *.spec.[cm][jt]s)
                 echo test ;;
-              *.md | *.mdx | *.rst | *.adoc | docs/* | */docs/* | doc/* | */doc/* | LICENSE | LICENSE.* | */LICENSE)
+              # Only prose and top-level doc images: code, specs and assets under a nested docs/ can ship.
+              *.md | *.mdx | *.rst | *.adoc | LICENSE | LICENSE.* | */LICENSE | .gitbook/assets/* | \
+              docs/*.png | docs/*.jpg | docs/*.jpeg | docs/*.gif | docs/*.svg | docs/*.webp | \
+              doc/*.png | doc/*.jpg | doc/*.jpeg | doc/*.gif | doc/*.svg | doc/*.webp)
                 echo docs ;;
               *) echo other ;;
             esac
@@ -105,15 +114,20 @@ jobs:
           elif [[ $total -ne $CHANGED_FILES ]]; then
             class=unknown; reasons+=("Read $total of $CHANGED_FILES changed files. The API lists at most 3,000.")
           elif [[ $AUTHOR == 'dependabot[bot]' ]]; then
-            if [[ $(jq -s 'length > 0 and all(.login == "dependabot[bot]" and .verified)' commits.jsonl) != true ]]; then
+            # GitHub signs Dependabot's commits as web-flow. A person can copy the author, but not that signature.
+            if [[ $(jq -s 'length > 0 and all(.login == "dependabot[bot]" and .committer == "web-flow" and .verified)' commits.jsonl) != true ]]; then
               class=code; reasons+=("Dependabot opened it, but not every commit is a signed Dependabot commit.")
             elif [[ $dependabot_files != yes ]]; then
               class=code; reasons+=("Dependabot opened it, but it changes files other than dependency manifests, lockfiles and workflow pins.")
             else
-              types=$(jq -r .message commits.jsonl | sed -n 's/.*update-type: version-update:semver-\([a-z]*\).*/\1/p' | sort -u)
-              if [[ $types == *major* || -z $types ]]; then
-                class=deps-major
-                if [[ -z $types ]]; then reasons+=("Dependabot commits do not state an update type."); else reasons+=("Includes a major version update."); fi
+              messages=$(jq -r .message commits.jsonl)
+              names=$(grep -c 'dependency-name:' <<< "$messages" || true)
+              stated=$(grep -c 'update-type: version-update:semver-' <<< "$messages" || true)
+              types=$(sed -n 's/.*update-type: version-update:semver-\([a-z]*\).*/\1/p' <<< "$messages" | sort -u)
+              if [[ $names -eq 0 || $stated -ne $names ]]; then
+                class=deps-major; reasons+=("Some Dependabot updates do not state an update type, such as a bump to a commit SHA.")
+              elif [[ $types == *major* ]]; then
+                class=deps-major; reasons+=("Includes a major version update.")
               elif [[ $types == *minor* ]]; then
                 class=deps-minor; reasons+=("Largest update is a minor version.")
               else
@@ -172,9 +186,12 @@ jobs:
           PR: ${{ github.event.pull_request.number }}
           LABEL: merge-safety/${{ steps.classify.outputs.class }}
         run: |
-          gh api "repos/$REPO/issues/$PR/labels" \
-            --jq '.[].name | select(startswith("merge-safety/")) | @uri' |
-            while read -r old; do
-              [[ $old == "${LABEL/\//%2F}" ]] || gh api -X DELETE "repos/$REPO/issues/$PR/labels/$old" --silent
-            done
+          # Labels are for people and metrics. Anything that acts on the class must read this job's result instead.
+          gh api --paginate "repos/$REPO/issues/$PR/labels?per_page=100" \
+            --jq '.[].name | select(startswith("merge-safety/")) | @uri' > old-labels.txt
+          while read -r old; do
+            if [[ $old != "${LABEL/\//%2F}" ]] && ! gh api -X DELETE "repos/$REPO/issues/$PR/labels/$old" --silent; then
+              echo "::warning title=Merge safety::Could not remove the old label $old"
+            fi
+          done < old-labels.txt
           gh api "repos/$REPO/issues/$PR/labels" -f "labels[]=$LABEL" --silent

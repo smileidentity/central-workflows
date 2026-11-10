@@ -70,17 +70,19 @@ It reads the PR's file list and commits through the API and never checks out PR 
 
 | Class | When |
 |---|---|
-| `docs-only` | Every file is documentation, such as Markdown or files under `docs/` |
+| `docs-only` | Every file is documentation: Markdown and other prose anywhere, or images directly under `docs/` |
 | `tests-only` | Every file is a test, fixture or documentation |
-| `deps-patch`, `deps-minor` | Dependabot opened it, every commit is a signed Dependabot commit, and it changes only manifests, lockfiles and workflow pins. The class is the largest update type |
-| `deps-major` | As above, with a major update or no stated update type |
+| `deps-patch`, `deps-minor` | Dependabot opened it, every commit is authored by Dependabot and signed by GitHub, and it changes only manifests, lockfiles and workflow pins. The class is the largest update type |
+| `deps-major` | As above, with a major update or an update with no stated type, such as a bump to a commit SHA |
 | `ci-config` | It changes `.github/`, other CI files or CODEOWNERS, plus at most tests and documentation |
-| `code` | Anything else, including dependency changes by a person and instructions for coding agents such as `AGENTS.md` |
+| `code` | Anything else, including dependency changes by a person, instructions for coding agents such as `AGENTS.md` or `.github/copilot-instructions.md`, and code under `docs/` |
 | `unknown` | The file list could not be read in full |
 
 A file that is renamed counts under its old and new paths, so moving code into `docs/` is still a code change. Fork PRs get the summary but no label, because their token is read-only.
 
-The classes are a first cut. Their labels over a few weeks show which ones are safe to auto-merge.
+The classes are a first cut. Their labels over a few weeks show which ones are safe to auto-merge. Anyone who can triage can change a label, so anything that acts on the class must read this job's result for the PR's head commit, not the label.
+
+Before the ruleset goes from evaluate to active, add a `merge_group` trigger, or repositories that use a merge queue cannot merge. Ruleset workflows run only on the default `pull_request` activity types, so a PR whose base branch changes keeps its old class until its next push.
 
 ## Releases
 
