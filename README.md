@@ -67,28 +67,34 @@ The Slack step needs a bot token with the `canvases:read` and `canvases:write` s
 When a lambda release changes the SDK spec, lambda sends a `sdk-spec-changed` repository dispatch here with the tag, the tag it was compared with, an `oasdiff` change summary, whether the change is breaking, and the lambda PR numbers.
 
 1. `sdk-spec-sync-record.yml` checks the payload and stores it as `state/pending/<tag>.json` on the `spec-sync-state` branch. It does nothing else, so many releases in a day cause no noise in the SDKs.
-2. `sdk-spec-sync.yml` runs at 06:00 UTC each day. It runs one job per repository: the seven `smileid-sdk-*` SDKs and `smileid-sdk-fixtures`. Each job gives Claude (`anthropics/claude-code-action`) the repository's `AGENTS.md`, the public spec `api-reference/specs/v3/openapi.yaml` at the old and new tags (api-reference only tags releases that change the public spec, so each lambda tag maps to the newest api-reference tag at or before it), the change summaries and the lambda PR descriptions. Claude makes the change with tests, golden fixtures and coverage, and runs the repository's checks. The prompt is `scripts/spec_sync/prompt.md`.
+2. `sdk-spec-sync.yml` runs at 06:00 UTC each day. It runs one job per repository: the seven `smileid-sdk-*` SDKs and `smileid-sdk-fixtures`. Each job gives Claude (`anthropics/claude-code-action`, on Amazon Bedrock) the repository's `AGENTS.md`, the public spec `api-reference/specs/v3/openapi.yaml` at the old and new tags (api-reference only tags releases that change the public spec, so each lambda tag maps to the newest api-reference tag at or before it), the change summaries and the lambda PR descriptions. Claude makes the change with tests, golden fixtures and coverage, and runs the repository's checks. The prompt is `scripts/spec_sync/prompt.md`.
 3. A separate publish job, on a fresh runner, clones the repository again and checks the change (no edits under `.github/`, no coverage exclusions, no conflict markers, and the branch hasn't moved since Claude started). It then commits it as `SMILE_GHA_BOT` and updates the repository's open `spec-sync/rolling` PR, or opens one as a draft labelled `spec-sync`. Each breaking release gets its own draft PR on `spec-sync/breaking-<tag>`, also labelled `breaking`. Each run rewrites the PR description; it never comments.
 4. When every job succeeds, the records move to `state/processed/`. If any job fails, they stay pending and the next run tries again. A job where Claude reports it is blocked still succeeds: its PR lists the gaps and stays a draft for a person to finish, and the records are processed.
 5. Every hour, the workflow marks draft spec-sync PRs ready for review once all their checks pass and Claude reported no gaps. It also rewrites the pinned "SDK spec sync status" issue, which shows each repository's open spec-sync PRs, spec tag and last run result.
 
-Claude never shares a runner with a write token. Its job has read-only tokens. When Claude finishes, a step with no token in its environment bundles the change as a binary patch, running git with hooks and fsmonitor turned off. The bundle is encrypted to the certificate in `sdk-spec-sync.yml`, because this repository's artifacts are public and two of the target repositories are private. The publish job runs this repository's own scripts, decrypts the bundle with `SPEC_SYNC_BUNDLE_KEY`, and accepts only plain files. It checks that the bundle is for its own repository and branch, and applies the patch to a fresh clone.
+Claude never shares a runner with a write token. Its job has read-only tokens and the Bedrock credentials. When Claude finishes, a step with no token or AWS credential in its environment bundles the change as a binary patch, running git with hooks and fsmonitor turned off. The bundle is encrypted to the certificate in `sdk-spec-sync.yml`, because this repository's artifacts are public and two of the target repositories are private. The publish job runs this repository's own scripts, decrypts the bundle with `SPEC_SYNC_BUNDLE_KEY`, and accepts only plain files. It checks that the bundle is for its own repository and branch, and applies the patch to a fresh clone.
 
 The worst a compromised Claude step can do is propose a bad change. The same checks and a person's review apply to it, as to any other spec-sync PR. Claude's output is not printed, because this repository's logs are public. Lambda PR descriptions are read on the runner and never published. The change summaries on the `spec-sync-state` branch come from `v3-sdk.yaml`. That spec is the public spec with some parts removed, so the summaries describe only what api-reference already shows.
 
 To clear a backlog, run `SDK spec sync` by hand with `from_tag` set to the spec tag the SDKs already match. Add `scope`, such as `AML operations`, to open a separate `spec-sync/<scope>` PR for one part of the spec. Use `repos`, such as `go`, to try one repository; pending records then stay pending.
 
-The workflows need these secrets. Until they exist, the daily run skips with a warning and records stay pending.
+Claude runs on Smile ID's Amazon Bedrock account, so there is no Anthropic API key. The sync job swaps GitHub's OIDC token for AWS credentials that last 3 hours and can only call Claude.
 
-- `ANTHROPIC_API_KEY`
-- `SMILE_GHA_BOT_CLIENT_ID` and `SMILE_GHA_BOT_PRIVATE_KEY`, already set for the organisation. The app must be installed on this repository. It needs contents, pull requests and issues write access on the SDK and fixtures repositories, checks and statuses read access, and pull requests read access on lambda.
-- `SPEC_SYNC_BUNDLE_KEY`: the private key that matches `BUNDLE_CERT` in `sdk-spec-sync.yml`. To replace both, run `openssl req -x509 -newkey rsa:4096 -nodes -keyout key.pem -out cert.pem -days 3650 -subj "/CN=central-workflows spec-sync bundle"`. Paste `cert.pem` into the workflow, store `key.pem` as the secret, then delete it.
+The workflows need these secrets and variables. Until they exist, the daily run skips with a warning that names what is missing, and records stay pending.
+
+- `SPEC_SYNC_BEDROCK_ROLE_ARN` (variable): an IAM role in the Bedrock account, set up like `sievals-ci-bedrock`.
+  - Its trust policy allows `token.actions.githubusercontent.com` with `aud` `sts.amazonaws.com` and `sub` exactly `repo:smileidentity/central-workflows:ref:refs/heads/main`. This repository is public, so the role must not trust pull requests, other branches or a wildcard.
+  - Its only policy allows `bedrock:InvokeModel` and `bedrock:InvokeModelWithResponseStream` on the model in `SDK_SPEC_SYNC_MODEL`: the inference profile and the foundation models behind it.
+  - Its maximum session duration is at least 3 hours, because a sync job can run for 2.5 hours.
+  - Claude's step can request its own OIDC token, so no other AWS role may trust this repository.
+- `SPEC_SYNC_BEDROCK_REGION` (variable): the region the role calls Bedrock in, where access to the model is enabled.
+- `SDK_SPEC_SYNC_MODEL` (variable): the Bedrock inference profile ID of the Claude model, such as `global.anthropic.claude-...`. When it changes, update the role's policy first, or the sync fails with `AccessDeniedException`.
+- `SMILE_GHA_BOT_CLIENT_ID` and `SMILE_GHA_BOT_PRIVATE_KEY` (organisation secrets): an organisation admin must give this repository access to them. The app must be installed on the SDK, fixtures and lambda repositories. It needs contents, pull requests and issues write access on the SDK and fixtures repositories, checks and commit statuses read access, and pull requests read access on lambda.
+- `SPEC_SYNC_BUNDLE_KEY` (secret): the private key that matches `BUNDLE_CERT` in `sdk-spec-sync.yml`. To replace both, run `openssl req -x509 -newkey rsa:4096 -nodes -keyout key.pem -out cert.pem -days 3650 -subj "/CN=central-workflows spec-sync bundle"`. Paste `cert.pem` into the workflow, store `key.pem` as the secret, then delete it.
 
 The `spec-sync` and `breaking` labels must exist in every target repository, including `smileid-sdk-fixtures`.
 
-Merge order: smileid-sdk-rust#2 and #3, and smileid-sdk-fixtures#1, before the secrets are added. Merge this workflow before lambda#5217, or lambda's dispatches are lost until a `from_tag` run.
-
-Set the optional `SDK_SPEC_SYNC_MODEL` variable to choose the Claude model.
+Merge order: smileid-sdk-rust#2 and #3, and smileid-sdk-fixtures#1, before the Bedrock variables are set. Merge this workflow before lambda#5217, or lambda's dispatches are lost until a `from_tag` run.
 
 ## Releases
 

@@ -58,20 +58,25 @@ jobs:
       repos: ${{ steps.plan.outputs.repos }}
     steps:
       - id: secrets
-        name: Check the secrets are set
+        name: Check the secrets and variables are set
         env:
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          BEDROCK_ROLE_ARN: ${{ vars.SPEC_SYNC_BEDROCK_ROLE_ARN }}
+          BEDROCK_REGION: ${{ vars.SPEC_SYNC_BEDROCK_REGION }}
+          MODEL: ${{ vars.SDK_SPEC_SYNC_MODEL }}
           BOT_CLIENT_ID: ${{ secrets.SMILE_GHA_BOT_CLIENT_ID }}
           BOT_PRIVATE_KEY: ${{ secrets.SMILE_GHA_BOT_PRIVATE_KEY }}
           BUNDLE_KEY: ${{ secrets.SPEC_SYNC_BUNDLE_KEY }}
         run: |
           missing=()
-          [ -n "$ANTHROPIC_API_KEY" ] || missing+=(ANTHROPIC_API_KEY)
-          [ -n "$BUNDLE_KEY" ] || missing+=(SPEC_SYNC_BUNDLE_KEY)
-          [ -n "$BOT_CLIENT_ID" ] || missing+=(SMILE_GHA_BOT_CLIENT_ID)
-          [ -n "$BOT_PRIVATE_KEY" ] || missing+=(SMILE_GHA_BOT_PRIVATE_KEY)
+          [ -n "$BEDROCK_ROLE_ARN" ] || missing+=("SPEC_SYNC_BEDROCK_ROLE_ARN variable")
+          [ -n "$BEDROCK_REGION" ] || missing+=("SPEC_SYNC_BEDROCK_REGION variable")
+          [ -n "$MODEL" ] || missing+=("SDK_SPEC_SYNC_MODEL variable")
+          [ -n "$BUNDLE_KEY" ] || missing+=("SPEC_SYNC_BUNDLE_KEY secret")
+          [ -n "$BOT_CLIENT_ID" ] || missing+=("SMILE_GHA_BOT_CLIENT_ID secret")
+          [ -n "$BOT_PRIVATE_KEY" ] || missing+=("SMILE_GHA_BOT_PRIVATE_KEY secret")
           if [ ${#missing[@]} -gt 0 ]; then
-            echo "::warning::Spec sync is not set up yet: add the ${missing[*]} secret(s) to this repository. Nothing was synced; recorded lambda releases stay pending."
+            joined="$(printf '%s, ' "${missing[@]}")"
+            echo "::warning::Spec sync is not set up yet. This repository is missing: ${joined%, }. Nothing was synced; recorded lambda releases stay pending."
             echo "configured=false" >> "$GITHUB_OUTPUT"
           else
             echo "configured=true" >> "$GITHUB_OUTPUT"
@@ -108,6 +113,11 @@ jobs:
     name: ${{ matrix.repo }} (${{ matrix.branch }})
     runs-on: ubuntu-latest
     timeout-minutes: 150
+    # id-token lets the job swap GitHub's OIDC token for short-lived AWS
+    # credentials that can only call Claude on Bedrock.
+    permissions:
+      contents: read
+      id-token: write
     strategy:
       fail-fast: false
       max-parallel: 8
@@ -236,12 +246,22 @@ jobs:
           python3 "$TOOLS/scripts/spec_sync/spec_sync.py" prepare --unit "$UNIT" --workdir "$GITHUB_WORKSPACE" \
             --ctx "$CTX" --state-dir "$STATE" --template "$TOOLS/scripts/spec_sync/prompt.md"
 
+      # Claude runs on Smile ID's Bedrock account. The role trusts only this
+      # repository's main branch and can only invoke the Claude models.
+      - name: Get Bedrock credentials
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ vars.SPEC_SYNC_BEDROCK_ROLE_ARN }}
+          aws-region: ${{ vars.SPEC_SYNC_BEDROCK_REGION }}
+          role-session-name: spec-sync-${{ github.run_id }}-${{ strategy.job-index }}
+          role-duration-seconds: 10800
+
       # This job has no write token. Claude edits the working tree; the publish job pushes.
       # Its output stays out of the logs, which are public in this repository.
       - id: claude
         uses: anthropics/claude-code-action@925afb53776cf1a2b738c6bdbed37b4d4000ef13 # v1.0.262
         with:
-          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          use_bedrock: 'true'
           github_token: ${{ github.token }}
           show_full_output: 'false'
           display_report: 'false'
@@ -252,10 +272,10 @@ jobs:
             --max-turns 300
             --add-dir ${{ runner.temp }}/spec-sync
             --allowedTools Bash,Read,Write,Edit,MultiEdit,Glob,Grep,TodoWrite
-            ${{ vars.SDK_SPEC_SYNC_MODEL && format('--model {0}', vars.SDK_SPEC_SYNC_MODEL) || '' }}
+            --model ${{ vars.SDK_SPEC_SYNC_MODEL }}
 
-      # No token is in this step's environment, and git runs no hooks or
-      # fsmonitor from the tree Claude worked in.
+      # No token or AWS credential is in this step's environment, and git runs
+      # no hooks or fsmonitor from the tree Claude worked in.
       - name: Bundle the change for the publish job
         if: ${{ !cancelled() && steps.prepare.outcome == 'success' }}
         env:
@@ -294,6 +314,7 @@ jobs:
             FHw+YXMkDAd2/xkUDIU=
             -----END CERTIFICATE-----
         run: |
+          unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN ACTIONS_ID_TOKEN_REQUEST_TOKEN ACTIONS_ID_TOKEN_REQUEST_URL
           bundle="$RUNNER_TEMP/bundle"
           python3 "$TOOLS/scripts/spec_sync/spec_sync.py" package --unit "$UNIT" --workdir "$GITHUB_WORKSPACE" \
             --ctx "$CTX" --base "$BASE" --default-sha "$DEFAULT_SHA" --dest "$bundle"
