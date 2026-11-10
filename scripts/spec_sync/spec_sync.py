@@ -5,7 +5,8 @@ Subcommands:
   record          store a sdk-spec-changed dispatch as state/pending/<tag>.json
   plan            work out which SDK jobs to run from the pending records
   prepare         set up an SDK checkout and the context files for Claude
-  publish         check Claude's changes, push them and create or update the PR
+  package         bundle Claude's change for the publish job
+  publish         check the sync job's patch, push it and create or update the PR
   mark-processed  move records from state/pending to state/processed
   status          mark green spec-sync PRs ready and rewrite the status issue
 
@@ -104,8 +105,13 @@ def git_auth_env(token):
     }
 
 
+# Never run hooks or fsmonitor from a repository: the sync job's working tree
+# was writable by Claude.
+GIT_SAFE = ["-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false"]
+
+
 def git(args, cwd, token=None, **kwargs):
-    return run(["git", *args], cwd=cwd, env=git_auth_env(token), **kwargs)
+    return run(["git", *GIT_SAFE, *args], cwd=cwd, env=git_auth_env(token), **kwargs)
 
 
 # ---------------------------------------------------------------------------
@@ -258,7 +264,20 @@ def unit(kind, branch, base_tag, spec_tag, records, scope=""):
     }
 
 
-def plan(pending, *, from_tag="", scope="", repos="", latest_api_tag=None, sync_due=True):
+def api_tag_for(tag, api_tags):
+    """The newest api-reference tag at or before a lambda tag.
+
+    api-reference only gets a tag when a lambda release changes the public
+    spec, so most lambda tags have no tag of their own there.
+    """
+    key = tag_key(tag)
+    candidates = [t for t in api_tags if TAG_RE.match(t) and tag_key(t) <= key]
+    if not candidates:
+        raise SpecSyncError(f"api-reference has no tag at or before {tag}")
+    return max(candidates, key=tag_key)
+
+
+def plan(pending, *, from_tag="", scope="", repos="", latest_api_tag=None, sync_due=True, api_tags=None):
     """Return the matrix of jobs to run and the records they consume.
 
     Non-breaking records share the rolling PR. Each breaking record gets its own
@@ -279,7 +298,11 @@ def plan(pending, *, from_tag="", scope="", repos="", latest_api_tag=None, sync_
             raise SpecSyncError("Could not find the latest api-reference tag")
         if tag_key(latest_api_tag) < tag_key(from_tag):
             raise SpecSyncError(f"from_tag {from_tag} is newer than the latest api-reference tag {latest_api_tag}")
+        # The SDKs already match from_tag, so older pending records are done too.
+        already = [r["tag"] for r in pending if tag_key(r["tag"]) <= tag_key(from_tag)]
         pending = [r for r in pending if tag_key(r["tag"]) > tag_key(from_tag)]
+    else:
+        already = []
 
     units = []
     if scope:
@@ -296,7 +319,17 @@ def plan(pending, *, from_tag="", scope="", repos="", latest_api_tag=None, sync_
             units.append(
                 unit("breaking", f"spec-sync/breaking-{record['tag']}", record["previous_tag"], record["tag"], [record])
             )
-        consumed = [r["tag"] for r in pending]
+        consumed = already + [r["tag"] for r in pending]
+
+    # Records carry lambda tags; the specs are read from api-reference tags.
+    if api_tags is not None:
+        mapped = []
+        for u in units:
+            u["base_tag"] = api_tag_for(u["base_tag"], api_tags)
+            u["spec_tag"] = api_tag_for(u["spec_tag"], api_tags)
+            if u["base_tag"] != u["spec_tag"] or u["kind"] == "scoped":
+                mapped.append(u)
+        units = mapped
 
     include = [{"repo": repo, **u} for u in units for repo in targets]
     result.update(
@@ -497,18 +530,28 @@ def render_task(template, values):
     return re.sub(r"\{\{(\w+)\}\}", substitute, template)
 
 
-def prepare(*, u, repo, workdir, ctx, state_dir, template, write_token, read_token):
+def default_branch(repo, token):
+    return gh(["repo", "view", f"{ORG}/{repo}", "--json", "defaultBranchRef", "-q", ".defaultBranchRef.name"],
+              token).strip()
+
+
+def prepare(*, u, repo, workdir, ctx, state_dir, template, token, read_token):
+    """Set up the working tree and Claude's context. Needs only a read token.
+
+    Returns the state, including `base` (the commit Claude's change is
+    measured from) and `default_sha`, which the publish job checks.
+    """
     ctx = Path(ctx)
     (ctx / "out").mkdir(parents=True, exist_ok=True)
-    default = gh(["repo", "view", f"{ORG}/{repo}", "--json", "defaultBranchRef", "-q", ".defaultBranchRef.name"],
-                 write_token).strip()
+    default = default_branch(repo, token)
     branch = u["branch"]
-    pr = find_open_pr(repo, branch, write_token)
+    pr = find_open_pr(repo, branch, token)
     remote = f"{GIT_BASE}/{ORG}/{repo}.git"
-    git(["fetch", "--quiet", remote, f"+refs/heads/{default}:refs/remotes/origin/{default}"], workdir, write_token)
+    git(["fetch", "--quiet", remote, f"+refs/heads/{default}:refs/remotes/origin/{default}"], workdir, token)
+    default_sha = git(["rev-parse", f"origin/{default}"], workdir).strip()
     conflict = False
     if pr:
-        git(["fetch", "--quiet", remote, f"+refs/heads/{branch}:refs/remotes/origin/{branch}"], workdir, write_token)
+        git(["fetch", "--quiet", remote, f"+refs/heads/{branch}:refs/remotes/origin/{branch}"], workdir, token)
         git(["checkout", "--quiet", "-B", branch, f"origin/{branch}"], workdir)
         code, _, _ = git(
             ["-c", "user.name=spec-sync", "-c", "user.email=spec-sync@invalid",
@@ -518,7 +561,7 @@ def prepare(*, u, repo, workdir, ctx, state_dir, template, write_token, read_tok
         conflict = code != 0
     else:
         git(["checkout", "--quiet", "-B", branch, f"origin/{default}"], workdir)
-    head = git(["rev-parse", "HEAD"], workdir).strip()
+    base = git(["rev-parse", f"origin/{branch}" if pr else f"origin/{default}"], workdir).strip()
 
     previous = read_marker(pr["body"], PR_MARKER) if pr else {}
     records = [r for r in (find_record(state_dir, t) for t in u["tags"]) if r]
@@ -561,10 +604,8 @@ def prepare(*, u, repo, workdir, ctx, state_dir, template, write_token, read_tok
         "repo_note": FIXTURES_NOTE if repo == FIXTURES_REPO else SDK_NOTE.format(ctx=ctx),
     }
     (ctx / "TASK.md").write_text(render_task(template, values))
-    state = {"repo": repo, "default": default, "head": head, "pr": pr, "conflict": conflict,
-             "previous": previous, "unit": u}
-    (ctx / "state.json").write_text(json.dumps(state, indent=2))
-    return state
+    return {"repo": repo, "default": default, "base": base, "default_sha": default_sha, "pr": pr,
+            "conflict": conflict, "previous": previous, "unit": u}
 
 
 SDK_NOTE = (
@@ -581,33 +622,104 @@ FIXTURES_NOTE = (
 )
 
 
-def publish(*, workdir, ctx, state_dir, write_token, bot_name, bot_email, run_url, now):
-    ctx = Path(ctx)
-    state = read_json(ctx / "state.json")
-    if not state:
-        raise SpecSyncError("prepare did not finish, so there is nothing to publish")
-    u, repo, default, pr = state["unit"], state["repo"], state["default"], state["pr"]
+SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+
+
+def package(*, u, workdir, ctx, base, default_sha, dest):
+    """Bundle Claude's change for the publish job. Runs with no token.
+
+    The bundle is the working tree's diff from `base` as a binary patch,
+    Claude's result and summary, and the commits the patch was made against.
+    """
+    dest = Path(dest)
+    dest.mkdir(parents=True, exist_ok=True)
+    git(["add", "-A"], workdir)
+    patch = git(["diff", "--cached", "--binary", "--full-index", base], workdir)
+    (dest / "change.patch").write_text(patch)
+    for name in ("result.json", "summary.md"):
+        source = Path(ctx) / "out" / name
+        if source.exists():
+            (dest / name).write_bytes(source.read_bytes())
+    meta = {"repo": u["repo"], "branch": u["branch"], "base": base, "default_sha": default_sha}
+    (dest / "meta.json").write_text(json.dumps(meta))
+    return meta
+
+
+def publish(*, u, workdir, bundle, out, state_dir, write_token, bot_name, bot_email, run_url, now):
+    """Check the sync job's patch and push it, from a fresh clone.
+
+    Runs in its own job, after Claude's job has ended. Nothing it uses comes
+    from Claude's runner except the bundle: a patch, Claude's result and
+    summary, and the two commits the patch was made against. Each is checked
+    before it is used.
+    """
+    out, bundle = Path(out), Path(bundle)
+    out.mkdir(parents=True, exist_ok=True)
+    repo = u["repo"]
+    if repo not in ALL_REPOS or not str(u.get("branch", "")).startswith("spec-sync/"):
+        raise SpecSyncError("The job does not describe a spec-sync branch, so nothing was pushed")
+    default = default_branch(repo, write_token)
+    if u["branch"] == default:
+        raise SpecSyncError("The spec-sync branch is the default branch, so nothing was pushed")
+    pr = find_open_pr(repo, u["branch"], write_token)
     outcome = {"repo": repo, "branch": u["branch"], "kind": u["kind"], "spec_tag": u["spec_tag"],
                "status": "failed", "pr_url": pr["url"] if pr else ""}
 
     def finish(status, error=None):
         outcome["status"] = status
-        (ctx / "out" / "job-result.json").write_text(json.dumps(outcome))
+        (out / "job-result.json").write_text(json.dumps(outcome))
         if error:
             raise SpecSyncError(error)
         return outcome
 
-    result = read_json(ctx / "out" / "result.json")
+    meta = read_json(bundle / "meta.json")
+    if not isinstance(meta, dict) or (meta.get("repo"), meta.get("branch")) != (repo, u["branch"]):
+        return finish("failed", "The sync job's bundle is missing or is for another job, so nothing was pushed")
+    base, default_sha = meta.get("base", ""), meta.get("default_sha", "")
+    if not SHA_RE.match(base) or not SHA_RE.match(default_sha):
+        return finish("failed", "The sync job's bundle has no valid base commits, so nothing was pushed")
+    result = read_json(bundle / "result.json")
     if not isinstance(result, dict) or result.get("status") not in ("changed", "no_change", "blocked"):
         return finish("failed", "Claude did not write a valid result.json, so nothing was pushed")
-    summary_path = ctx / "out" / "summary.md"
+    summary_path = bundle / "summary.md"
     summary = summary_path.read_text() if summary_path.exists() else ""
+    patch_path = bundle / "change.patch"
+    patch = patch_path.read_text(errors="replace") if patch_path.exists() else ""
 
-    # claude-code-action points origin at central-workflows; use explicit URLs from here on.
     remote = f"{GIT_BASE}/{ORG}/{repo}.git"
-    git(["add", "-A"], workdir)
-    changed_files = [f for f in git(["diff", "--cached", "--name-only", f"origin/{default}"], workdir).splitlines() if f]
-    problems = guard_problems(changed_files, git(["diff", "--cached", f"origin/{default}"], workdir))
+    git(["fetch", "--quiet", remote, f"+refs/heads/{default}:refs/remotes/origin/{default}"], workdir, write_token)
+    code, _, _ = git(["merge-base", "--is-ancestor", default_sha, f"origin/{default}"], workdir, check=False)
+    if code != 0:
+        return finish("failed", f"{default_sha[:12]} is not on {default}, so nothing was pushed")
+    if pr:
+        git(["fetch", "--quiet", remote, f"+refs/heads/{u['branch']}:refs/remotes/origin/{u['branch']}"],
+            workdir, write_token)
+        expected = git(["rev-parse", f"origin/{u['branch']}"], workdir).strip()
+    else:
+        expected = default_sha
+    if base != expected:
+        return finish("failed", f"{u['branch']} changed while Claude worked, so nothing was pushed. The next run retries.")
+
+    git(["checkout", "--quiet", "-B", u["branch"], base], workdir)
+    # The sync job merged the default branch in. Record that merge; the patch
+    # brings the merged and resolved files.
+    code, _, _ = git(["merge-base", "--is-ancestor", default_sha, "HEAD"], workdir, check=False)
+    merging = code != 0
+    if merging:
+        git(["merge", "--quiet", "--no-commit", "-s", "ours", default_sha], workdir)
+
+    # The patch also carries the default branch's merged-in changes, so the
+    # guards run after applying it, on the result compared with that branch.
+    if patch.strip():
+        patch_file = out / "change.patch"
+        patch_file.write_text(patch)
+        code, _, err = git(["apply", "--index", "--binary", "--whitespace=nowarn", str(patch_file)], workdir,
+                           check=False)
+        if code != 0:
+            return finish("failed", f"The patch did not apply, so nothing was pushed: {err.strip()[:300]}")
+    # Guard again on the result, compared with the default branch, as the PR shows it.
+    changed_files = [f for f in git(["diff", "--cached", "--name-only", default_sha], workdir).splitlines() if f]
+    problems = guard_problems(changed_files, git(["diff", "--cached", default_sha], workdir))
     if problems:
         for problem in problems:
             print(f"::error::{problem}")
@@ -618,20 +730,19 @@ def publish(*, workdir, ctx, state_dir, write_token, bot_name, bot_email, run_ur
         return finish("no_change")
 
     code, _, _ = git(["diff", "--cached", "--quiet"], workdir, check=False)
-    merging = (Path(workdir) / ".git" / "MERGE_HEAD").exists()
     if code != 0 or merging:
         git(["-c", f"user.name={bot_name}", "-c", f"user.email={bot_email}", "commit", "--quiet",
              "--no-verify", "-m", f"Sync with the API spec at {u['spec_tag']}"], workdir)
     head = git(["rev-parse", "HEAD"], workdir).strip()
-    pushed = head != state["head"] or not pr
+    pushed = head != base or not pr
     if pushed:
-        push = ["push", "--quiet", remote, f"HEAD:refs/heads/{u['branch']}"]
+        push = ["push", "--quiet", "--no-verify", remote, f"HEAD:refs/heads/{u['branch']}"]
         if not pr:
             # No open PR, so any branch left over from a merged or closed one is replaced.
             push.insert(1, "--force")
         git(push, workdir, write_token)
 
-    previous = state.get("previous") or {}
+    previous = read_marker(pr["body"], PR_MARKER) if pr else {}
     tags = merge_tags(previous.get("tags", []), u["tags"])
     spec_tag = max([u["spec_tag"], *([previous["spec_tag"]] if previous.get("spec_tag") else [])], key=tag_key)
     lambda_prs = sorted(set(previous.get("lambda_prs", [])) | set(u["lambda_prs"]))
@@ -641,7 +752,7 @@ def publish(*, workdir, ctx, state_dir, write_token, bot_name, bot_email, run_ur
         ready_ok = False
     body = render_pr_body(repo=repo, u=u, tags=tags, spec_tag=spec_tag, lambda_prs=lambda_prs, records=records,
                           summary=summary, result=result, ready_ok=ready_ok, run_url=run_url, now=now)
-    body_file = ctx / "out" / "pr-body.md"
+    body_file = out / "pr-body.md"
     body_file.write_text(body)
     title = pr_title(u, spec_tag)
     full = f"{ORG}/{repo}"
@@ -831,9 +942,19 @@ def main(argv=None):
     p.add_argument("--state-dir", required=True)
     p.add_argument("--template", required=True)
 
-    p = sub.add_parser("publish")
+    p = sub.add_parser("package")
+    p.add_argument("--unit", required=True, help="the matrix entry as JSON")
     p.add_argument("--workdir", required=True)
     p.add_argument("--ctx", required=True)
+    p.add_argument("--base", required=True)
+    p.add_argument("--default-sha", required=True)
+    p.add_argument("--dest", required=True)
+
+    p = sub.add_parser("publish")
+    p.add_argument("--unit", required=True, help="the matrix entry as JSON")
+    p.add_argument("--workdir", required=True, help="an empty git repository to publish from")
+    p.add_argument("--bundle", required=True, help="the decrypted bundle from the sync job")
+    p.add_argument("--out", required=True)
     p.add_argument("--state-dir", required=True)
     p.add_argument("--bot-name", required=True)
     p.add_argument("--bot-email", required=True)
@@ -861,7 +982,8 @@ def main(argv=None):
             api_tags = Path(args.api_tags_file).read_text().split() if args.api_tags_file else []
             result = plan(load_records(args.state_dir, "pending"), from_tag=args.from_tag.strip(),
                           scope=args.scope.strip(), repos=args.repos, latest_api_tag=latest_tag(api_tags),
-                          sync_due=args.sync_due == "true")
+                          sync_due=args.sync_due == "true",
+                          api_tags=api_tags if args.api_tags_file else None)
             for key in ("has_work", "mark_processed"):
                 write_output(key, str(result[key]).lower())
             write_output("tags", result["tags"])
@@ -872,13 +994,19 @@ def main(argv=None):
                   + "; ".join(f"{u['branch']} {u['base_tag']}..{u['spec_tag']}" for u in result["units"]))
         elif args.command == "prepare":
             u = json.loads(args.unit)
-            prepare(u=u, repo=u["repo"], workdir=args.workdir, ctx=args.ctx, state_dir=args.state_dir,
-                    template=Path(args.template).read_text(), write_token=os.environ["WRITE_TOKEN"],
-                    read_token=os.environ.get("READ_TOKEN", ""))
+            state = prepare(u=u, repo=u["repo"], workdir=args.workdir, ctx=args.ctx, state_dir=args.state_dir,
+                            template=Path(args.template).read_text(), token=os.environ["REPO_TOKEN"],
+                            read_token=os.environ.get("READ_TOKEN", ""))
+            write_output("base", state["base"])
+            write_output("default_sha", state["default_sha"])
+        elif args.command == "package":
+            meta = package(u=json.loads(args.unit), workdir=args.workdir, ctx=args.ctx, base=args.base,
+                           default_sha=args.default_sha, dest=args.dest)
+            print(f"Bundled the change to {meta['repo']} {meta['branch']} from {meta['base'][:12]}")
         elif args.command == "publish":
-            publish(workdir=args.workdir, ctx=args.ctx, state_dir=args.state_dir,
-                    write_token=os.environ["WRITE_TOKEN"], bot_name=args.bot_name, bot_email=args.bot_email,
-                    run_url=args.run_url, now=now_utc())
+            publish(u=json.loads(args.unit), workdir=args.workdir, bundle=args.bundle, out=args.out,
+                    state_dir=args.state_dir, write_token=os.environ["WRITE_TOKEN"], bot_name=args.bot_name,
+                    bot_email=args.bot_email, run_url=args.run_url, now=now_utc())
         elif args.command == "mark-processed":
             moved = mark_processed(args.state_dir, json.loads(args.tags), now_utc(), args.run_url)
             print(f"Marked as processed: {', '.join(moved) or 'nothing'}")

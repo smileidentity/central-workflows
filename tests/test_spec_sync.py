@@ -152,7 +152,8 @@ class PlanTest(unittest.TestCase):
         rolling = p["units"][0]
         self.assertEqual((rolling["base_tag"], rolling["spec_tag"], rolling["tags"]),
                          ("v3.10.0", "v3.15.0", ["v3.12.0"]))
-        self.assertEqual(p["tags"], ["v3.11.0", "v3.12.0"])
+        # v3.10.0 is at or before from_tag, which the SDKs already match, so it is done too.
+        self.assertEqual(p["tags"], ["v3.10.0", "v3.11.0", "v3.12.0"])
         self.assertEqual([u["kind"] for u in p["units"]], ["rolling", "breaking"])
 
     def test_from_tag_with_nothing_pending(self):
@@ -182,7 +183,7 @@ class PlanTest(unittest.TestCase):
         state = tempfile.mkdtemp()
         write_state(state, "pending", *self.pending)
         tags = Path(state) / "tags.txt"
-        tags.write_text("v3.12.0\nv3.9.0\n")
+        tags.write_text("v3.12.0\nv3.9.0\nv3.10.0\nv3.11.0\n")
         out = Path(state) / "out.txt"
         with mock.patch.dict(os.environ, {"GITHUB_OUTPUT": str(out)}), mock.patch("builtins.print"):
             self.assertEqual(s.main(["plan", "--state-dir", state, "--api-tags-file", str(tags)]), 0)
@@ -191,6 +192,25 @@ class PlanTest(unittest.TestCase):
         self.assertIn('tags<<SPEC_SYNC_EOF\n["v3.10.0","v3.11.0","v3.12.0"]\n', text)
         matrix = json.loads(text.split("matrix<<SPEC_SYNC_EOF\n")[1].split("\n")[0])
         self.assertEqual(len(matrix["include"]), 16)
+
+
+    def test_lambda_tags_map_to_api_reference_tags(self):
+        # api-reference only has tags for releases that changed the public spec.
+        api_tags = ["v3.8.0", "v3.11.0", "junk"]
+        p = s.plan(self.pending, latest_api_tag="v3.11.0", api_tags=api_tags)
+        rolling, breaking = p["units"]
+        self.assertEqual((rolling["base_tag"], rolling["spec_tag"]), ("v3.8.0", "v3.11.0"))
+        self.assertEqual((breaking["base_tag"], breaking["spec_tag"]), ("v3.8.0", "v3.11.0"))
+        self.assertEqual(p["tags"], ["v3.10.0", "v3.11.0", "v3.12.0"])
+
+    def test_unit_with_no_public_spec_change_is_skipped(self):
+        p = s.plan([record("v3.12.0", "v3.11.0")], latest_api_tag="v3.10.0", api_tags=["v3.10.0"])
+        self.assertFalse(p["has_work"])
+        self.assertEqual(p["tags"], ["v3.12.0"])
+
+    def test_tag_older_than_every_api_reference_tag(self):
+        with self.assertRaises(s.SpecSyncError):
+            s.plan(self.pending, latest_api_tag="v3.20.0", api_tags=["v3.20.0"])
 
 
 class BodyTest(unittest.TestCase):
@@ -433,6 +453,7 @@ class PrepareAndPublishTest(unittest.TestCase):
         self.work = self.tmp / "work"
         sh(["git", "clone", "-q", str(self.remote), str(self.work)])
         self.ctx = self.tmp / "ctx"
+        self.out = self.tmp / "out"
         self.state = self.tmp / "state"
         write_state(self.state, "pending", record("v3.12.0", "v3.11.0", prs=[5100, 404], summary="Added phone."))
         write_state(self.state, "processed", record("v3.10.0", "v3.9.0", summary="Added address."))
@@ -445,13 +466,25 @@ class PrepareAndPublishTest(unittest.TestCase):
 
     def prepare(self, fake):
         with mock.patch.object(s, "gh", fake):
-            return s.prepare(u=self.unit, repo="smileid-sdk-go", workdir=self.work, ctx=self.ctx,
-                             state_dir=self.state, template=TEMPLATE, write_token="", read_token="r")
+            self.prepared = s.prepare(u=self.unit, repo="smileid-sdk-go", workdir=self.work, ctx=self.ctx,
+                                      state_dir=self.state, template=TEMPLATE, token="", read_token="r")
+        return self.prepared
 
-    def publish(self, fake):
+    def package(self):
+        self.runs = getattr(self, "runs", 0) + 1
+        self.bundle = self.tmp / f"bundle{self.runs}"
+        return s.package(u=self.unit, workdir=self.work, ctx=self.ctx, base=self.prepared["base"],
+                         default_sha=self.prepared["default_sha"], dest=self.bundle)
+
+    def publish(self, fake, package=True):
+        """Package the sync job's tree, then publish it from a fresh repository, as the publish job does."""
+        if package:
+            self.package()
+        fresh = self.tmp / f"publish{self.runs}"
+        sh(["git", "init", "-q", str(fresh)])
         with mock.patch.object(s, "gh", fake), mock.patch("builtins.print"):
-            return s.publish(workdir=self.work, ctx=self.ctx, state_dir=self.state, write_token="",
-                             bot_name="bot[bot]", bot_email="1+bot[bot]@users.noreply.github.com",
+            return s.publish(u=self.unit, workdir=fresh, bundle=self.bundle, out=self.out, state_dir=self.state,
+                             write_token="", bot_name="bot[bot]", bot_email="1+bot[bot]@users.noreply.github.com",
                              run_url=RUN, now=NOW)
 
     def claude(self, status="changed", files=None, gaps=()):
@@ -493,7 +526,7 @@ class PrepareAndPublishTest(unittest.TestCase):
         self.assertNotIn("Secret details", fake.body)
         author = sh(["git", "--git-dir", str(self.remote), "log", "-1", "--format=%an", "spec-sync/rolling"]).strip()
         self.assertEqual(author, "bot[bot]")
-        saved = json.loads((self.ctx / "out" / "job-result.json").read_text())
+        saved = json.loads((self.out / "job-result.json").read_text())
         self.assertEqual(saved["status"], "updated")
 
     def test_updates_the_open_pr(self):
@@ -556,7 +589,7 @@ class PrepareAndPublishTest(unittest.TestCase):
         self.claude(files={".github/ci.yml": "on: pull_request\n"})
         with self.assertRaises(s.SpecSyncError), mock.patch("builtins.print"):
             self.publish(fake)
-        self.assertEqual(json.loads((self.ctx / "out" / "job-result.json").read_text())["status"], "failed")
+        self.assertEqual(json.loads((self.out / "job-result.json").read_text())["status"], "failed")
         self.assertNotIn("spec-sync/rolling", sh(["git", "--git-dir", str(self.remote), "branch"]))
 
     def test_no_change_and_missing_result(self):
@@ -584,14 +617,70 @@ class PrepareAndPublishTest(unittest.TestCase):
         os.symlink(self.remote, self.remote.parent / "smileid-sdk-fixtures.git")
         with mock.patch.object(s, "gh", FakeGitHub()):
             s.prepare(u=self.unit, repo="smileid-sdk-fixtures", workdir=self.work, ctx=self.ctx,
-                      state_dir=self.state, template=TEMPLATE, write_token="", read_token="")
+                      state_dir=self.state, template=TEMPLATE, token="", read_token="")
         task = (self.ctx / "TASK.md").read_text()
         self.assertIn("scripts/build_cases.py", task)
         self.assertIn("no token could read lambda", (self.ctx / "lambda-prs.md").read_text())
 
-    def test_publish_without_prepare(self):
+    def test_publish_without_a_bundle(self):
+        self.runs, self.bundle = 1, self.tmp / "no-bundle"
         with self.assertRaises(s.SpecSyncError):
-            self.publish(FakeGitHub())
+            self.publish(FakeGitHub(), package=False)
+        self.assertEqual(json.loads((self.out / "job-result.json").read_text())["status"], "failed")
+
+    def test_refuses_a_bundle_for_another_job(self):
+        fake = FakeGitHub()
+        self.prepare(fake)
+        self.claude()
+        self.package()
+        meta = json.loads((self.bundle / "meta.json").read_text())
+        (self.bundle / "meta.json").write_text(json.dumps({**meta, "branch": "main"}))
+        with self.assertRaises(s.SpecSyncError):
+            self.publish(fake, package=False)
+        self.assertNotIn("spec-sync/rolling", sh(["git", "--git-dir", str(self.remote), "branch"]))
+
+    def test_refuses_a_job_that_is_not_a_spec_sync_branch(self):
+        self.unit.update(branch="main")
+        self.runs, self.bundle = 1, self.tmp / "no-bundle"
+        with self.assertRaises(s.SpecSyncError):
+            self.publish(FakeGitHub(), package=False)
+
+    def test_refuses_when_the_branch_moved(self):
+        sh(["git", "checkout", "-qb", "spec-sync/rolling"], self.work)
+        sh(["git", "push", "-q", "origin", "spec-sync/rolling"], self.work)
+        sh(["git", "checkout", "-q", "main"], self.work)
+        fake = FakeGitHub({"number": 12, "url": "u12", "isDraft": True, "body": ""})
+        self.prepare(fake)
+        self.claude()
+        self.package()
+        # Someone pushes to the PR branch while Claude works.
+        other = self.tmp / "other"
+        sh(["git", "clone", "-q", "-b", "spec-sync/rolling", str(self.remote), str(other)])
+        (other / "manual.go").write_text("package smileid\n")
+        sh(["git", "add", "-A"], other)
+        sh(["git", "-c", "user.name=t", "-c", "user.email=t@example.com", "commit", "-qm", "manual"], other)
+        sh(["git", "push", "-q", "origin", "spec-sync/rolling"], other)
+        with self.assertRaisesRegex(s.SpecSyncError, "changed while Claude worked"):
+            self.publish(fake, package=False)
+        self.assertNotIn("phone.go", self.remote_files("spec-sync/rolling"))
+
+    def test_package_runs_no_hooks_or_fsmonitor(self):
+        fake = FakeGitHub()
+        self.prepare(fake)
+        self.claude()
+        planted = self.tmp / "planted"
+        hook = self.tmp / "hook.sh"
+        hook.write_text(f"#!/bin/sh\ntouch {planted}\n")
+        hook.chmod(0o755)
+        sh(["git", "config", "core.fsmonitor", str(hook)], self.work)
+        hooks = self.work / ".git" / "hooks"
+        hooks.mkdir(exist_ok=True)
+        for name in ("pre-commit", "post-index-change", "reference-transaction"):
+            (hooks / name).write_text(hook.read_text())
+            (hooks / name).chmod(0o755)
+        self.package()
+        self.assertFalse(planted.exists(), "a hook or fsmonitor from the working tree ran")
+        self.assertIn("phone.go", (self.bundle / "change.patch").read_text())
 
 
 class TemplateTest(unittest.TestCase):

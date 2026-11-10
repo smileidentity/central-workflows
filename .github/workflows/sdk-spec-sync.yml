@@ -9,6 +9,12 @@ name: SDK spec sync
 #
 # Every hour, the status job marks draft spec-sync PRs ready once all their
 # checks pass, and rewrites the pinned "SDK spec sync status" issue.
+#
+# Claude never shares a runner with a write token. The sync job, with only
+# read tokens, runs Claude and bundles its change as a patch, encrypted to
+# BUNDLE_CERT below because this repository's artifacts are public. The
+# publish job then runs on a fresh runner with this repository's own scripts,
+# clones the SDK again, checks the patch and pushes it.
 on:
   schedule:
     - cron: '0 6 * * *' # daily sync; keep in step with SYNC_CRON below
@@ -57,9 +63,11 @@ jobs:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           BOT_CLIENT_ID: ${{ secrets.SMILE_GHA_BOT_CLIENT_ID }}
           BOT_PRIVATE_KEY: ${{ secrets.SMILE_GHA_BOT_PRIVATE_KEY }}
+          BUNDLE_KEY: ${{ secrets.SPEC_SYNC_BUNDLE_KEY }}
         run: |
           missing=()
           [ -n "$ANTHROPIC_API_KEY" ] || missing+=(ANTHROPIC_API_KEY)
+          [ -n "$BUNDLE_KEY" ] || missing+=(SPEC_SYNC_BUNDLE_KEY)
           [ -n "$BOT_CLIENT_ID" ] || missing+=(SMILE_GHA_BOT_CLIENT_ID)
           [ -n "$BOT_PRIVATE_KEY" ] || missing+=(SMILE_GHA_BOT_PRIVATE_KEY)
           if [ ${#missing[@]} -gt 0 ]; then
@@ -113,17 +121,16 @@ jobs:
             echo "STATE=$RUNNER_TEMP/state"
           } >> "$GITHUB_ENV"
 
-      # Write access to the one repository this job changes.
-      - id: write-token
+      # Read access to the one repository this job changes. Writing happens in the publish job.
+      - id: repo-token
         uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
         with:
           client-id: ${{ secrets.SMILE_GHA_BOT_CLIENT_ID }}
           private-key: ${{ secrets.SMILE_GHA_BOT_PRIVATE_KEY }}
           owner: smileidentity
           repositories: ${{ matrix.repo }}
-          permission-contents: write
-          permission-pull-requests: write
-          permission-issues: write
+          permission-contents: read
+          permission-pull-requests: read
 
       # Read-only, for lambda PR descriptions and the persona cases. The job carries on without them.
       - id: lambda-token
@@ -182,7 +189,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: smileidentity/${{ matrix.repo }}
-          token: ${{ steps.write-token.outputs.token }}
+          token: ${{ steps.repo-token.outputs.token }}
           fetch-depth: 0
           persist-credentials: false
 
@@ -223,13 +230,13 @@ jobs:
         name: Prepare the branch and Claude's instructions
         env:
           UNIT: ${{ toJSON(matrix) }}
-          WRITE_TOKEN: ${{ steps.write-token.outputs.token }}
+          REPO_TOKEN: ${{ steps.repo-token.outputs.token }}
           READ_TOKEN: ${{ steps.lambda-token.outputs.token }}
         run: |
           python3 "$TOOLS/scripts/spec_sync/spec_sync.py" prepare --unit "$UNIT" --workdir "$GITHUB_WORKSPACE" \
             --ctx "$CTX" --state-dir "$STATE" --template "$TOOLS/scripts/spec_sync/prompt.md"
 
-      # Claude gets no write token: it edits the working tree and the next step publishes.
+      # This job has no write token. Claude edits the working tree; the publish job pushes.
       # Its output stays out of the logs, which are public in this repository.
       - id: claude
         uses: anthropics/claude-code-action@925afb53776cf1a2b738c6bdbed37b4d4000ef13 # v1.0.262
@@ -247,17 +254,134 @@ jobs:
             --allowedTools Bash,Read,Write,Edit,MultiEdit,Glob,Grep,TodoWrite
             ${{ vars.SDK_SPEC_SYNC_MODEL && format('--model {0}', vars.SDK_SPEC_SYNC_MODEL) || '' }}
 
-      - name: Check and publish the change
+      # No token is in this step's environment, and git runs no hooks or
+      # fsmonitor from the tree Claude worked in.
+      - name: Bundle the change for the publish job
         if: ${{ !cancelled() && steps.prepare.outcome == 'success' }}
         env:
+          UNIT: ${{ toJSON(matrix) }}
+          BASE: ${{ steps.prepare.outputs.base }}
+          DEFAULT_SHA: ${{ steps.prepare.outputs.default_sha }}
+          BUNDLE_CERT: |
+            -----BEGIN CERTIFICATE-----
+            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
+            FHw+YXMkDAd2/xkUDIU=
+            -----END CERTIFICATE-----
+        run: |
+          bundle="$RUNNER_TEMP/bundle"
+          python3 "$TOOLS/scripts/spec_sync/spec_sync.py" package --unit "$UNIT" --workdir "$GITHUB_WORKSPACE" \
+            --ctx "$CTX" --base "$BASE" --default-sha "$DEFAULT_SHA" --dest "$bundle"
+          printf '%s\n' "$BUNDLE_CERT" > "$RUNNER_TEMP/bundle-cert.pem"
+          (cd "$bundle" && tar -cf "$RUNNER_TEMP/bundle.tar" -- *)
+          mkdir -p "$RUNNER_TEMP/upload"
+          openssl cms -encrypt -binary -aes256 -outform DER -in "$RUNNER_TEMP/bundle.tar" \
+            -out "$RUNNER_TEMP/upload/bundle.cms" "$RUNNER_TEMP/bundle-cert.pem"
+      - if: ${{ !cancelled() && steps.prepare.outcome == 'success' }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: spec-sync-bundle-${{ strategy.job-index }}
+          path: ${{ runner.temp }}/upload/bundle.cms
+          retention-days: 3
+
+  publish:
+    needs: [plan, sync]
+    if: ${{ always() && needs.plan.outputs.has_work == 'true' }}
+    name: publish ${{ matrix.repo }} (${{ matrix.branch }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      max-parallel: 8
+      # The same matrix as the sync job, so strategy.job-index matches its bundle.
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    steps:
+      # A fresh runner and this repository's own scripts: nothing here comes
+      # from the sync job except the encrypted bundle, which is checked.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - id: write-token
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ secrets.SMILE_GHA_BOT_CLIENT_ID }}
+          private-key: ${{ secrets.SMILE_GHA_BOT_PRIVATE_KEY }}
+          owner: smileidentity
+          repositories: ${{ matrix.repo }}
+          permission-contents: write
+          permission-pull-requests: write
+          permission-issues: write
+
+      - id: download
+        continue-on-error: true
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: spec-sync-bundle-${{ strategy.job-index }}
+          path: ${{ runner.temp }}/download
+
+      - name: Check and publish the change
+        env:
+          UNIT: ${{ toJSON(matrix) }}
+          BUNDLE_KEY: ${{ secrets.SPEC_SYNC_BUNDLE_KEY }}
           WRITE_TOKEN: ${{ steps.write-token.outputs.token }}
           GH_TOKEN: ${{ steps.write-token.outputs.token }}
           BOT: ${{ steps.write-token.outputs.app-slug }}[bot]
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
+          state="$RUNNER_TEMP/state"
+          if [ -n "$(git ls-remote "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY.git" refs/heads/spec-sync-state)" ]; then
+            git clone --quiet --depth 1 --branch spec-sync-state "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY.git" "$state"
+          else
+            mkdir -p "$state"
+          fi
+          bundle="$RUNNER_TEMP/bundle"
+          mkdir -p "$bundle"
+          if [ -f "$RUNNER_TEMP/download/bundle.cms" ]; then
+            key="$RUNNER_TEMP/bundle-key.pem"
+            (umask 077 && printf '%s\n' "$BUNDLE_KEY" > "$key")
+            openssl cms -decrypt -binary -inform DER -in "$RUNNER_TEMP/download/bundle.cms" -inkey "$key" \
+              -out "$RUNNER_TEMP/bundle.tar"
+            rm -f "$key"
+            # Plain files only, with no links, devices, absolute paths or "..".
+            if tar -tvf "$RUNNER_TEMP/bundle.tar" | grep -qv '^-' \
+              || tar -tf "$RUNNER_TEMP/bundle.tar" | grep -qE '^/|(^|/)\.\.(/|$)'; then
+              echo "::error::The bundle holds something other than plain files, so nothing was pushed."
+              exit 1
+            fi
+            tar -C "$bundle" --no-same-owner --no-same-permissions -xf "$RUNNER_TEMP/bundle.tar"
+          fi
+          workdir="$RUNNER_TEMP/repo"
+          git init --quiet "$workdir"
           bot_id=$(gh api "/users/${BOT/\[bot\]/%5Bbot%5D}" --jq .id)
-          python3 "$TOOLS/scripts/spec_sync/spec_sync.py" publish --workdir "$GITHUB_WORKSPACE" --ctx "$CTX" \
-            --state-dir "$STATE" --bot-name "$BOT" --bot-email "$bot_id+$BOT@users.noreply.github.com" --run-url "$RUN_URL"
+          python3 scripts/spec_sync/spec_sync.py publish --unit "$UNIT" --workdir "$workdir" --bundle "$bundle" \
+            --out "$RUNNER_TEMP/result" --state-dir "$state" --bot-name "$BOT" \
+            --bot-email "$bot_id+$BOT@users.noreply.github.com" --run-url "$RUN_URL"
 
       # Only this small file is uploaded: artifacts of a public repository are public.
       - name: Save the job result
@@ -266,10 +390,8 @@ jobs:
           REPO: ${{ matrix.repo }}
           BRANCH: ${{ matrix.branch }}
         run: |
-          mkdir -p "$RUNNER_TEMP/result"
-          if [ -f "$CTX/out/job-result.json" ]; then
-            cp "$CTX/out/job-result.json" "$RUNNER_TEMP/result/job-result.json"
-          else
+          if [ ! -f "$RUNNER_TEMP/result/job-result.json" ]; then
+            mkdir -p "$RUNNER_TEMP/result"
             jq -n --arg repo "$REPO" --arg branch "$BRANCH" '{repo: $repo, branch: $branch, status: "failed"}' \
               > "$RUNNER_TEMP/result/job-result.json"
           fi
@@ -281,8 +403,8 @@ jobs:
           retention-days: 7
 
   finish:
-    needs: [plan, sync]
-    if: needs.plan.outputs.mark_processed == 'true' && needs.sync.result == 'success'
+    needs: [plan, sync, publish]
+    if: needs.plan.outputs.mark_processed == 'true' && needs.sync.result == 'success' && needs.publish.result == 'success'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
@@ -302,7 +424,7 @@ jobs:
             python3 "$tools/spec_sync.py" mark-processed --state-dir . --tags "$TAGS" --run-url "$RUN_URL"
 
   status:
-    needs: [plan, sync, finish]
+    needs: [plan, sync, publish, finish]
     if: ${{ always() && needs.plan.outputs.configured == 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -317,13 +439,14 @@ jobs:
           private-key: ${{ secrets.SMILE_GHA_BOT_PRIVATE_KEY }}
           owner: smileidentity
           repositories: smileid-sdk-go,smileid-sdk-java,smileid-sdk-js,smileid-sdk-php,smileid-sdk-python,smileid-sdk-ruby,smileid-sdk-rust,smileid-sdk-fixtures
+          permission-contents: read
           permission-pull-requests: write
           permission-checks: read
           permission-statuses: read
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - if: needs.sync.result != 'skipped'
+      - if: needs.publish.result != 'skipped'
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: spec-sync-result-*
@@ -332,8 +455,8 @@ jobs:
         env:
           APP_TOKEN: ${{ steps.app-token.outputs.token }}
           ISSUE_TOKEN: ${{ github.token }}
-          REPOS: ${{ needs.sync.result != 'skipped' && needs.plan.outputs.repos || '[]' }}
-          SYNC_RESULT: ${{ needs.sync.result }}
+          REPOS: ${{ needs.publish.result != 'skipped' && needs.plan.outputs.repos || '[]' }}
+          SYNC_RESULT: ${{ needs.sync.result == 'success' && needs.publish.result || needs.sync.result }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           state="$RUNNER_TEMP/state"
