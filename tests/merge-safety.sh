@@ -9,8 +9,12 @@ tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 failed=0
 
-dependabot() { jq -nc --arg m "$2" --argjson v "${3:-true}" '{login: "dependabot[bot]", verified: $v, message: $m}' >> "$1/commits.jsonl"; }
-human() { jq -nc '{login: "octocat", verified: false, message: "Change"}' >> "$1/commits.jsonl"; }
+# dependabot DIR MESSAGE [VERIFIED] [COMMITTER]
+dependabot() {
+  jq -nc --arg m "$2" --argjson v "${3:-true}" --arg c "${4:-web-flow}" \
+    '{login: "dependabot[bot]", committer: $c, verified: $v, message: $m}' >> "$1/commits.jsonl"
+}
+human() { jq -nc '{login: "octocat", committer: "octocat", verified: false, message: "Change"}' >> "$1/commits.jsonl"; }
 patch='updated-dependencies:
 - dependency-name: left-pad
   update-type: version-update:semver-patch'
@@ -54,9 +58,9 @@ check agents-dir code octocat .agents/skills/write-docs/references/markdown.md
 check gemini code octocat GEMINI.md
 check workflow-markdown ci-config octocat .github/workflows/triage.md
 check gitbook-assets docs-only octocat .gitbook/assets/flow.png SUMMARY.md
-check code-under-docs code octocat frontend/src/components/reusable/docs/sdk.tsx
+check code-under-docs code octocat web/src/components/docs/sdk.tsx
 check openapi-under-docs code octocat docs/openapi/v3.yaml
-check test-named-main-source code octocat usesmileid-testing/src/main/java/com/usesmileid/testing/UseSmileIDTest.kt
+check test-named-main-source code octocat testing/src/main/java/com/example/testing/ExampleTest.kt
 check spec-yaml code octocat api/openapi.spec.yaml
 check code code octocat src/index.ts README.md
 check rename-out-of-code code octocat $'docs/old.ts\tsrc/old.ts'
