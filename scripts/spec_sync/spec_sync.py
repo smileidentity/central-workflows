@@ -490,12 +490,14 @@ def read_json(path, default=None):
 
 
 def find_open_pr(repo, branch, token):
+    """The open PR from this repository's own branch. --head also matches fork
+    branches of the same name, and the SDK repositories are public."""
     out = gh(
         ["pr", "list", "--repo", f"{ORG}/{repo}", "--head", branch, "--state", "open",
-         "--json", "number,url,isDraft,body", "--limit", "1"],
+         "--json", "number,url,isDraft,body,isCrossRepository", "--limit", "20"],
         token,
     )
-    prs = json.loads(out or "[]")
+    prs = [pr for pr in json.loads(out or "[]") if not pr.get("isCrossRepository", True)]
     return prs[0] if prs else None
 
 
@@ -805,11 +807,13 @@ def promote_prs(repos, token):
     for repo in repos:
         out = gh(
             ["pr", "list", "--repo", f"{ORG}/{repo}", "--label", LABEL, "--state", "open",
-             "--json", "number,url,isDraft,body,headRefName,statusCheckRollup", "--limit", "50"],
+             "--json", "number,url,isDraft,body,headRefName,statusCheckRollup,isCrossRepository", "--limit", "50"],
             token,
         )
         prs = []
         for pr in json.loads(out or "[]"):
+            if pr.get("isCrossRepository", True):
+                continue
             marker = read_marker(pr.get("body"), PR_MARKER)
             checks = checks_state(pr.get("statusCheckRollup"))
             draft = pr.get("isDraft", False)

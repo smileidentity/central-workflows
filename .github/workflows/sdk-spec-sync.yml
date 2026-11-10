@@ -66,6 +66,8 @@ jobs:
           BOT_CLIENT_ID: ${{ secrets.SMILE_GHA_BOT_CLIENT_ID }}
           BOT_PRIVATE_KEY: ${{ secrets.SMILE_GHA_BOT_PRIVATE_KEY }}
           BUNDLE_KEY: ${{ secrets.SPEC_SYNC_BUNDLE_KEY }}
+          READER_CLIENT_ID: ${{ secrets.SPEC_SYNC_READER_CLIENT_ID }}
+          READER_PRIVATE_KEY: ${{ secrets.SPEC_SYNC_READER_PRIVATE_KEY }}
         run: |
           missing=()
           [ -n "$BEDROCK_ROLE_ARN" ] || missing+=("SPEC_SYNC_BEDROCK_ROLE_ARN variable")
@@ -74,6 +76,8 @@ jobs:
           [ -n "$BUNDLE_KEY" ] || missing+=("SPEC_SYNC_BUNDLE_KEY secret")
           [ -n "$BOT_CLIENT_ID" ] || missing+=("SMILE_GHA_BOT_CLIENT_ID secret")
           [ -n "$BOT_PRIVATE_KEY" ] || missing+=("SMILE_GHA_BOT_PRIVATE_KEY secret")
+          [ -n "$READER_CLIENT_ID" ] || missing+=("SPEC_SYNC_READER_CLIENT_ID secret")
+          [ -n "$READER_PRIVATE_KEY" ] || missing+=("SPEC_SYNC_READER_PRIVATE_KEY secret")
           if [ ${#missing[@]} -gt 0 ]; then
             joined="$(printf '%s, ' "${missing[@]}")"
             echo "::warning::Spec sync is not set up yet. This repository is missing: ${joined%, }. Nothing was synced; recorded lambda releases stay pending."
@@ -131,37 +135,45 @@ jobs:
             echo "STATE=$RUNNER_TEMP/state"
           } >> "$GITHUB_ENV"
 
+      # Claude's runner never sees SMILE_GHA_BOT's key. Its tokens come from the
+      # SPEC_SYNC_READER app, which can only read. They expire after an hour.
       # Read access to the one repository this job changes. Writing happens in the publish job.
       - id: repo-token
         uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
         with:
-          client-id: ${{ secrets.SMILE_GHA_BOT_CLIENT_ID }}
-          private-key: ${{ secrets.SMILE_GHA_BOT_PRIVATE_KEY }}
+          client-id: ${{ secrets.SPEC_SYNC_READER_CLIENT_ID }}
+          private-key: ${{ secrets.SPEC_SYNC_READER_PRIVATE_KEY }}
           owner: smileidentity
           repositories: ${{ matrix.repo }}
           permission-contents: read
           permission-pull-requests: read
+          # A post step would run after Claude with the private key as an input.
+          skip-token-revoke: true
 
       # Read-only, for lambda PR descriptions and the persona cases. The job carries on without them.
       - id: lambda-token
         continue-on-error: true
         uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
         with:
-          client-id: ${{ secrets.SMILE_GHA_BOT_CLIENT_ID }}
-          private-key: ${{ secrets.SMILE_GHA_BOT_PRIVATE_KEY }}
+          client-id: ${{ secrets.SPEC_SYNC_READER_CLIENT_ID }}
+          private-key: ${{ secrets.SPEC_SYNC_READER_PRIVATE_KEY }}
           owner: smileidentity
           repositories: lambda
           permission-pull-requests: read
+          # A post step would run after Claude with the private key as an input.
+          skip-token-revoke: true
       - id: fixtures-token
         if: matrix.repo != 'smileid-sdk-fixtures'
         continue-on-error: true
         uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
         with:
-          client-id: ${{ secrets.SMILE_GHA_BOT_CLIENT_ID }}
-          private-key: ${{ secrets.SMILE_GHA_BOT_PRIVATE_KEY }}
+          client-id: ${{ secrets.SPEC_SYNC_READER_CLIENT_ID }}
+          private-key: ${{ secrets.SPEC_SYNC_READER_PRIVATE_KEY }}
           owner: smileidentity
           repositories: smileid-sdk-fixtures
           permission-contents: read
+          # A post step would run after Claude with the private key as an input.
+          skip-token-revoke: true
 
       # Claude works in the workspace root, so everything else lives in RUNNER_TEMP.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -245,6 +257,28 @@ jobs:
         run: |
           python3 "$TOOLS/scripts/spec_sync/spec_sync.py" prepare --unit "$UNIT" --workdir "$GITHUB_WORKSPACE" \
             --ctx "$CTX" --state-dir "$STATE" --template "$TOOLS/scripts/spec_sync/prompt.md"
+
+      # The runner process holds this job's secrets in memory. Take away the ways
+      # Claude's Bash could read it: passwordless sudo and the Docker socket.
+      # Yama keeps a process from reading memory it did not start.
+      - name: Remove root access before Claude runs
+        run: |
+          sudo systemctl stop docker.socket docker.service containerd.service 2>/dev/null || true
+          sudo rm -f /var/run/docker.sock /run/containerd/containerd.sock
+          echo "$(id -un) ALL=(ALL) !ALL" | sudo tee /etc/sudoers.d/zz-spec-sync-no-sudo > /dev/null
+          sudo chmod 0440 /etc/sudoers.d/zz-spec-sync-no-sudo
+          if sudo -n true 2>/dev/null; then
+            echo "::error::sudo still works, so Claude could read the runner's secrets."
+            exit 1
+          fi
+          if docker info > /dev/null 2>&1; then
+            echo "::error::Docker still runs, so Claude could get root."
+            exit 1
+          fi
+          if [ "$(cat /proc/sys/kernel/yama/ptrace_scope 2>/dev/null || echo 0)" -lt 1 ]; then
+            echo "::error::kernel.yama.ptrace_scope is 0, so Claude could read the runner's memory."
+            exit 1
+          fi
 
       # Claude runs on Smile ID's Bedrock account. The role trusts only this
       # repository's main branch and can only invoke the Claude models.

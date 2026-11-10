@@ -303,11 +303,14 @@ class StatusTest(unittest.TestCase):
     def test_promote(self):
         green = [{"__typename": "CheckRun", "status": "COMPLETED", "conclusion": "SUCCESS"}]
         listed = [
+            {"number": 2, "url": "u2", "isDraft": True, "headRefName": "spec-sync/rolling", "statusCheckRollup": green,
+             "isCrossRepository": True, "body": s.write_marker(s.PR_MARKER, {"ready_ok": True})},
             {"number": 3, "url": "u3", "isDraft": True, "headRefName": "spec-sync/rolling", "statusCheckRollup": green,
-             "body": s.write_marker(s.PR_MARKER, {"ready_ok": True, "spec_tag": "v3.12.0"})},
+             "isCrossRepository": False, "body": s.write_marker(s.PR_MARKER, {"ready_ok": True, "spec_tag": "v3.12.0"})},
             {"number": 4, "url": "u4", "isDraft": True, "headRefName": "spec-sync/breaking-v3.11.0",
-             "statusCheckRollup": green, "body": s.write_marker(s.PR_MARKER, {"ready_ok": False})},
+             "isCrossRepository": False, "statusCheckRollup": green, "body": s.write_marker(s.PR_MARKER, {"ready_ok": False})},
             {"number": 5, "url": "u5", "isDraft": True, "headRefName": "spec-sync/aml", "statusCheckRollup": [],
+             "isCrossRepository": False,
              "body": s.write_marker(s.PR_MARKER, {"ready_ok": True})},
         ]
         calls = []
@@ -322,6 +325,14 @@ class StatusTest(unittest.TestCase):
         prs = found["smileid-sdk-go"]
         self.assertEqual([(p["number"], p["draft"], p["checks"]) for p in prs],
                          [(3, False, "success"), (4, True, "success"), (5, True, "none")])
+
+    def test_find_open_pr_skips_forks(self):
+        listed = [{"number": 7, "url": "u7", "isDraft": True, "body": "fork", "isCrossRepository": True},
+                  {"number": 8, "url": "u8", "isDraft": True, "body": "ours", "isCrossRepository": False}]
+        with mock.patch.object(s, "gh", lambda args, token, **kw: json.dumps(listed)):
+            self.assertEqual(s.find_open_pr("smileid-sdk-go", "spec-sync/rolling", "t")["number"], 8)
+        with mock.patch.object(s, "gh", lambda args, token, **kw: json.dumps(listed[:1])):
+            self.assertIsNone(s.find_open_pr("smileid-sdk-go", "spec-sync/rolling", "t"))
 
     def test_last_runs(self):
         previous = {"smileid-sdk-go": {"result": "updated", "run_url": "old", "at": "then"},
@@ -543,7 +554,7 @@ class PrepareAndPublishTest(unittest.TestCase):
         sh(["git", "push", "-q", "origin", "main"], self.work)
 
         marker = s.write_marker(s.PR_MARKER, {"tags": ["v3.10.0"], "spec_tag": "v3.10.0", "lambda_prs": [1]})
-        fake = FakeGitHub({"number": 12, "url": "u12", "isDraft": False, "body": marker})
+        fake = FakeGitHub({"number": 12, "url": "u12", "isDraft": False, "body": marker, "isCrossRepository": False})
         state = self.prepare(fake)
         self.assertFalse(state["conflict"])
         self.assertIn("already covers v3.10.0", (self.ctx / "TASK.md").read_text())
@@ -570,7 +581,7 @@ class PrepareAndPublishTest(unittest.TestCase):
         sh(["git", "-c", "user.name=t", "-c", "user.email=t@example.com", "commit", "-qam", "main"], self.work)
         sh(["git", "push", "-q", "origin", "main"], self.work)
 
-        fake = FakeGitHub({"number": 12, "url": "u12", "isDraft": True, "body": ""})
+        fake = FakeGitHub({"number": 12, "url": "u12", "isDraft": True, "body": "", "isCrossRepository": False})
         self.assertTrue(self.prepare(fake)["conflict"])
         self.assertIn("Resolve every conflict marker", (self.ctx / "TASK.md").read_text())
         # Claude leaves a conflict marker behind, so nothing is pushed.
@@ -649,7 +660,7 @@ class PrepareAndPublishTest(unittest.TestCase):
         sh(["git", "checkout", "-qb", "spec-sync/rolling"], self.work)
         sh(["git", "push", "-q", "origin", "spec-sync/rolling"], self.work)
         sh(["git", "checkout", "-q", "main"], self.work)
-        fake = FakeGitHub({"number": 12, "url": "u12", "isDraft": True, "body": ""})
+        fake = FakeGitHub({"number": 12, "url": "u12", "isDraft": True, "body": "", "isCrossRepository": False})
         self.prepare(fake)
         self.claude()
         self.package()
