@@ -73,7 +73,7 @@ Add a job at the end of the scheduled workflow that needs every other job:
     if: ${{ !cancelled() }}
     permissions:
       issues: write
-    uses: smileidentity/central-workflows/.github/workflows/scheduled-run-status.yml@v1
+    uses: smileidentity/central-workflows/.github/workflows/scheduled-run-status.yml@<full commit SHA from main>
     with:
       failed: ${{ contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') }}
       team: team:api
@@ -81,7 +81,7 @@ Add a job at the end of the scheduled workflow that needs every other job:
       slack-webhook-url: ${{ secrets.NIGHTLY_SLACK_WEBHOOK_URL }}
 ```
 
-List every job in `needs`: a job left out cannot turn the report red. `failed` counts cancelled jobs as well as failed ones, so a job that stops part-way still opens an issue. `!cancelled()` skips the report when someone cancels the whole run.
+List every job in `needs`: a job left out cannot turn the report red. `failed` counts cancelled jobs as well as failed ones, so a job that stops part-way still opens an issue. `!cancelled()` skips the report when someone cancels the whole run. A skipped job counts as a pass, so a job skipped by its own `if:`, such as a check for a missing secret, closes the issue. Make such a guard fail the job instead of skipping it.
 
 The job only acts on `schedule` and `workflow_dispatch` runs of the default branch, so the same workflow can also run on pull requests. A manual run on another branch leaves the issue alone.
 
