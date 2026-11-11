@@ -82,7 +82,7 @@ A file that is renamed counts under its old and new paths, so moving code into `
 
 The classes are a first cut. Their labels over a few weeks show which ones are safe to auto-merge. Anyone who can triage can change a label, so anything that acts on the class must read this job's result for the PR's head commit, not the label.
 
-Before the ruleset goes from evaluate to active, add a `merge_group` trigger, or repositories that use a merge queue cannot merge. Ruleset workflows run only on the default `pull_request` activity types, so a PR whose base branch changes keeps its old class until its next push.
+The workflow also runs on `merge_group`, so a repository that uses a merge queue can still merge once the ruleset is active. In a merge queue it only reports success: the PR was classified on its last push. Ruleset workflows run only on the default `pull_request` activity types, so a PR whose base branch changes keeps its old class until its next push.
 
 ## Releases
 
