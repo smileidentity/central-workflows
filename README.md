@@ -85,7 +85,7 @@ The workflows need these secrets and variables. Until they exist, the daily run 
 
 - `SPEC_SYNC_BEDROCK_ROLE_ARN` (variable): an IAM role in the Bedrock account, set up like `sievals-ci-bedrock`.
   - Its trust policy allows `token.actions.githubusercontent.com` with `aud` `sts.amazonaws.com` and `sub` exactly `repo:smileidentity@24418837/central-workflows@1360252165:ref:refs/heads/main`. This repository uses GitHub's immutable subject format, with the owner and repository IDs, so `repo:smileidentity/central-workflows:...` never matches. This repository is public, so the role must not trust pull requests, other branches or a wildcard.
-  - Its only policy allows `bedrock:InvokeModel` and `bedrock:InvokeModelWithResponseStream` on the model in `SDK_SPEC_SYNC_MODEL`: the inference profile and the foundation models behind it.
+  - Its only policy allows `bedrock:InvokeModel` and `bedrock:InvokeModelWithResponseStream` on the model in `SDK_SPEC_SYNC_MODEL` (the inference profile and the foundation models behind it), `bedrock:GetInferenceProfile` on that profile, and `bedrock:ListInferenceProfiles`, which Claude Code uses at startup. Claude Code's background requests to its smaller model use the same model.
   - Its maximum session duration is at least 3 hours, because a sync job can run for 2.5 hours.
   - Claude's step can request its own OIDC token, so no other AWS role may trust this repository.
 - `SPEC_SYNC_BEDROCK_REGION` (variable): the region the role calls Bedrock in, where access to the model is enabled.

@@ -294,6 +294,11 @@ jobs:
       # Its output stays out of the logs, which are public in this repository.
       - id: claude
         uses: anthropics/claude-code-action@925afb53776cf1a2b738c6bdbed37b4d4000ef13 # v1.0.262
+        env:
+          # The Bedrock role allows one model, so Claude Code's background
+          # requests to its smaller model use the same one.
+          ANTHROPIC_DEFAULT_HAIKU_MODEL: ${{ vars.SDK_SPEC_SYNC_MODEL }}
+          ANTHROPIC_SMALL_FAST_MODEL: ${{ vars.SDK_SPEC_SYNC_MODEL }}
         with:
           use_bedrock: 'true'
           github_token: ${{ github.token }}
