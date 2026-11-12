@@ -40,6 +40,9 @@ jobs:
           python3 -m unittest discover -s tests -v
           bash tests/spec-sync-state.sh
 
+      - name: Test the merge-safety workflow
+        run: bash tests/merge-safety.sh
+
       - name: Test the deploy-status workflow
         run: |
           command -v xmllint > /dev/null || { sudo apt-get update -q && sudo apt-get install -yq libxml2-utils; }
