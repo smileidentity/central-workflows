@@ -258,6 +258,20 @@ jobs:
           python3 "$TOOLS/scripts/spec_sync/spec_sync.py" prepare --unit "$UNIT" --workdir "$GITHUB_WORKSPACE" \
             --ctx "$CTX" --state-dir "$STATE" --template "$TOOLS/scripts/spec_sync/prompt.md"
 
+      # Claude has reported finding no merge base with the default branch and no
+      # release tags. Record what the checkout holds before and after Claude, so
+      # the log shows whether something made it shallow.
+      - name: Record the checkout's history before Claude runs
+        run: |
+          echo "shallow: $(git rev-parse --is-shallow-repository)"
+          echo "tags: $(git tag -l | wc -l)"
+          default="$(git symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null || echo origin/main)"
+          if git merge-base HEAD "$default" > /dev/null 2>&1; then
+            echo "merge base with ${default}: found"
+          else
+            echo "merge base with ${default}: missing"
+          fi
+
       # The runner process holds this job's secrets in memory. Take away the ways
       # Claude's Bash could read it: passwordless sudo and the Docker socket.
       # Yama keeps a process from reading memory it did not start.
@@ -355,6 +369,9 @@ jobs:
             -----END CERTIFICATE-----
         run: |
           unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN ACTIONS_ID_TOKEN_REQUEST_TOKEN ACTIONS_ID_TOKEN_REQUEST_URL
+          # Claude could have changed the git config, so read .git directly instead of running git.
+          if [ -f .git/shallow ]; then echo "after Claude, shallow: true"; else echo "after Claude, shallow: false"; fi
+          echo "after Claude, tags: $( { find .git/refs/tags -type f 2>/dev/null; grep -s ' refs/tags/' .git/packed-refs; } | wc -l)"
           bundle="$RUNNER_TEMP/bundle"
           python3 "$TOOLS/scripts/spec_sync/spec_sync.py" package --unit "$UNIT" --workdir "$GITHUB_WORKSPACE" \
             --ctx "$CTX" --base "$BASE" --default-sha "$DEFAULT_SHA" --dest "$bundle"
@@ -504,6 +521,8 @@ jobs:
           permission-pull-requests: write
           permission-checks: read
           permission-statuses: read
+          # gh pr list --json statusCheckRollup reads each check's workflow run.
+          permission-actions: read
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false

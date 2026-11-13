@@ -1,0 +1,174 @@
+name: Sync SDK fixture personas
+
+# Keeps smileid-sdk-fixtures in step with lambda's sandbox test identities, so
+# the SDKs' integration cases never drift from what sandbox returns. Once a day,
+# before the spec sync, run the fixtures repository's own sync script against
+# lambda's latest release tag (what sandbox runs). If the personas or cases
+# changed, commit them as SMILE_GHA_BOT to personas-sync/lambda and open or
+# update one pull request. A change to the recorded lambda commit alone is
+# ignored, so a lambda release that doesn't touch the identities makes no PR.
+#
+# No model runs here. The personas are copied by a fixed script, and nothing
+# from them is printed, because this repository's logs are public and
+# smileid-sdk-fixtures is private.
+on:
+  schedule:
+    - cron: '15 5 * * *' # daily, before the 06:00 spec sync
+  workflow_dispatch:
+    inputs:
+      lambda_ref:
+        description: Optional lambda tag to sync from, such as v3.1168.0. Default is the latest release tag.
+        type: string
+        default: ''
+
+permissions: {}
+
+concurrency:
+  group: sdk-fixtures-personas
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - id: secrets
+        name: Check the secrets are set
+        env:
+          BOT_CLIENT_ID: ${{ secrets.SMILE_GHA_BOT_CLIENT_ID }}
+          BOT_PRIVATE_KEY: ${{ secrets.SMILE_GHA_BOT_PRIVATE_KEY }}
+          READER_CLIENT_ID: ${{ secrets.SPEC_SYNC_READER_CLIENT_ID }}
+          READER_PRIVATE_KEY: ${{ secrets.SPEC_SYNC_READER_PRIVATE_KEY }}
+        run: |
+          missing=()
+          [ -n "$BOT_CLIENT_ID" ] || missing+=("SMILE_GHA_BOT_CLIENT_ID secret")
+          [ -n "$BOT_PRIVATE_KEY" ] || missing+=("SMILE_GHA_BOT_PRIVATE_KEY secret")
+          [ -n "$READER_CLIENT_ID" ] || missing+=("SPEC_SYNC_READER_CLIENT_ID secret")
+          [ -n "$READER_PRIVATE_KEY" ] || missing+=("SPEC_SYNC_READER_PRIVATE_KEY secret")
+          if [ ${#missing[@]} -gt 0 ]; then
+            joined="$(printf '%s, ' "${missing[@]}")"
+            echo "::warning::Persona sync is not set up yet. This repository is missing: ${joined%, }."
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "configured=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - id: lambda-token
+        if: steps.secrets.outputs.configured == 'true'
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ secrets.SPEC_SYNC_READER_CLIENT_ID }}
+          private-key: ${{ secrets.SPEC_SYNC_READER_PRIVATE_KEY }}
+          owner: smileidentity
+          repositories: lambda
+          permission-contents: read
+
+      - id: fixtures-token
+        if: steps.secrets.outputs.configured == 'true'
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ secrets.SMILE_GHA_BOT_CLIENT_ID }}
+          private-key: ${{ secrets.SMILE_GHA_BOT_PRIVATE_KEY }}
+          owner: smileidentity
+          repositories: smileid-sdk-fixtures
+          permission-contents: write
+          permission-pull-requests: write
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: steps.secrets.outputs.configured == 'true'
+        with:
+          repository: smileidentity/smileid-sdk-fixtures
+          token: ${{ steps.fixtures-token.outputs.token }}
+          path: fixtures
+          persist-credentials: false
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        if: steps.secrets.outputs.configured == 'true'
+        with:
+          node-version: '24'
+
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        if: steps.secrets.outputs.configured == 'true'
+        with:
+          python-version: '3.12'
+
+      - id: lambda
+        name: Check out lambda's shared package at the release
+        if: steps.secrets.outputs.configured == 'true'
+        env:
+          TOKEN: ${{ steps.lambda-token.outputs.token }}
+          LAMBDA_REF: ${{ inputs.lambda_ref }}
+        run: |
+          set -euo pipefail
+          auth="$(printf 'x-access-token:%s' "$TOKEN" | base64 -w0)"
+          export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=http.extraheader GIT_CONFIG_VALUE_0="AUTHORIZATION: basic $auth"
+          url=https://github.com/smileidentity/lambda.git
+          ref="$LAMBDA_REF"
+          if [ -z "$ref" ]; then
+            ref="$(git ls-remote --tags --refs "$url" 'v3.*' | awk -F/ '{print $3}' | sort -t. -k2,2n -k3,3n | tail -1)"
+          fi
+          if ! printf '%s' "$ref" | grep -Eq '^v3\.[0-9]+\.[0-9]+$'; then
+            echo "::error::'$ref' is not a lambda release tag such as v3.1168.0."
+            exit 1
+          fi
+          git clone --quiet --depth 1 --branch "$ref" --filter=blob:none --sparse "$url" "$RUNNER_TEMP/lambda"
+          git -C "$RUNNER_TEMP/lambda" sparse-checkout set packages/shared
+          echo "ref=$ref" >> "$GITHUB_OUTPUT"
+
+      - id: sync
+        name: Rebuild the personas and cases
+        if: steps.secrets.outputs.configured == 'true'
+        working-directory: fixtures
+        env:
+          REF: ${{ steps.lambda.outputs.ref }}
+        run: |
+          set -euo pipefail
+          pip install --quiet -r requirements-dev.txt
+          cp personas.json "$RUNNER_TEMP/personas-before.json"
+          scripts/sync_personas.sh "$RUNNER_TEMP/lambda" > /dev/null
+          # The recorded lambda commit changes with every release; only the rest matters.
+          if jq -e --slurpfile before "$RUNNER_TEMP/personas-before.json" \
+               'del(.source) == ($before[0] | del(.source))' personas.json > /dev/null \
+             && git diff --quiet -- cases; then
+            echo "The personas and cases already match lambda ${REF}."
+            git checkout --quiet -- personas.json
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            git status --short
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Open or update the pull request
+        if: steps.sync.outputs.changed == 'true'
+        working-directory: fixtures
+        env:
+          GH_TOKEN: ${{ steps.fixtures-token.outputs.token }}
+          BOT: ${{ steps.fixtures-token.outputs.app-slug }}[bot]
+          REF: ${{ steps.lambda.outputs.ref }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          repo=smileidentity/smileid-sdk-fixtures
+          branch=personas-sync/lambda
+          bot_id=$(gh api "/users/${BOT/\[bot\]/%5Bbot%5D}" --jq .id)
+          git checkout --quiet -B "$branch"
+          git add personas.json cases
+          git -c user.name="$BOT" -c user.email="$bot_id+$BOT@users.noreply.github.com" \
+            commit --quiet -m "Sync personas and cases with lambda ${REF}"
+          auth="$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)"
+          git -c http.extraheader="AUTHORIZATION: basic $auth" \
+            push --quiet --force "https://github.com/${repo}.git" "HEAD:refs/heads/${branch}"
+          body="$(printf '%s\n\n%s\n\n%s\n' \
+            "Lambda ${REF} changed the sandbox test identities, so this updates \`personas.json\` and rebuilds \`cases/\` with \`scripts/sync_personas.sh\`." \
+            "Review the case changes, then run the cases against dev before merging: \`python scripts/run_cases.py\`." \
+            "Opened by the [persona sync](${RUN_URL}). The next run replaces this branch, so don't push to it.")"
+          pr=$(gh pr list -R "$repo" --head "$branch" --state open --json number --jq '.[0].number // empty')
+          if [ -n "$pr" ]; then
+            gh pr edit "$pr" -R "$repo" --title "Sync personas and cases with lambda ${REF}" --body "$body" > /dev/null
+            echo "Updated https://github.com/${repo}/pull/${pr}"
+          else
+            gh pr create -R "$repo" --head "$branch" --base main \
+              --title "Sync personas and cases with lambda ${REF}" --body "$body"
+          fi

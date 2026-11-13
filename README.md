@@ -91,12 +91,20 @@ The workflows need these secrets and variables. Until they exist, the daily run 
 - `SPEC_SYNC_BEDROCK_REGION` (variable): the region the role calls Bedrock in, where access to the model is enabled.
 - `SDK_SPEC_SYNC_MODEL` (variable): the Bedrock inference profile ID of the Claude model, such as `global.anthropic.claude-...`. When it changes, update the role's policy first, or the sync fails with `AccessDeniedException`.
 - `SPEC_SYNC_READER_CLIENT_ID` and `SPEC_SYNC_READER_PRIVATE_KEY` (secrets): a GitHub App used only by Claude's job. Give it contents read and pull requests read access, and nothing else, and install it on the SDK, fixtures and lambda repositories.
-- `SMILE_GHA_BOT_CLIENT_ID` and `SMILE_GHA_BOT_PRIVATE_KEY` (organisation secrets): used only by the publish and status jobs. An organisation admin must give this repository access to them. The app must be installed on the SDK, fixtures and lambda repositories. It needs contents, pull requests and issues write access on the SDK and fixtures repositories, checks and commit statuses read access, and pull requests read access on lambda.
+- `SMILE_GHA_BOT_CLIENT_ID` and `SMILE_GHA_BOT_PRIVATE_KEY` (organisation secrets): used only by the publish and status jobs. An organisation admin must give this repository access to them. The app must be installed on the SDK, fixtures and lambda repositories. It needs contents, pull requests and issues write access on the SDK and fixtures repositories, actions, checks and commit statuses read access, and pull requests read access on lambda. The status job needs actions read because `gh pr list --json statusCheckRollup` reads each check's workflow run.
 - `SPEC_SYNC_BUNDLE_KEY` (secret): the private key that matches `BUNDLE_CERT` in `sdk-spec-sync.yml`. To replace both, run `openssl req -x509 -newkey rsa:4096 -nodes -keyout key.pem -out cert.pem -days 3650 -subj "/CN=central-workflows spec-sync bundle"`. Paste `cert.pem` into the workflow, store `key.pem` as the secret, then delete it.
 
 The `spec-sync` and `breaking` labels must exist in every target repository, including `smileid-sdk-fixtures`.
 
 Merge order: smileid-sdk-rust#2 and #3, and smileid-sdk-fixtures#1, before the Bedrock variables are set. Merge this workflow before lambda#5217, or lambda's dispatches are lost until a `from_tag` run.
+
+## Keep the SDK fixtures in step with sandbox
+
+The SDKs' integration cases in `smileid-sdk-fixtures` are generated from lambda's sandbox test identities (`packages/shared/v3/testIdentities.ts`), so they can't drift from what sandbox returns.
+
+`sdk-fixtures-personas.yml` runs at 05:15 UTC each day, before the spec sync. It checks out `packages/shared` from lambda's latest release tag, the code sandbox runs, and runs the fixtures repository's `scripts/sync_personas.sh`, which rebuilds `personas.json` and `cases/`. If anything changed apart from the recorded lambda commit, it commits as `SMILE_GHA_BOT` to `personas-sync/lambda` and opens or updates one pull request in `smileid-sdk-fixtures`. Run it by hand with `lambda_ref` to sync from a particular tag.
+
+No model runs in this workflow. It uses the `SPEC_SYNC_READER` app to read lambda, and `SMILE_GHA_BOT` (contents and pull requests write on `smileid-sdk-fixtures`) to publish. It prints only file names, because this repository's logs are public and the fixtures repository is private.
 
 ## Merge safety
 
