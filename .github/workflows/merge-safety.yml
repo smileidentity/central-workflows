@@ -3,9 +3,11 @@ name: Merge safety
 # Sorts each PR into one risk class from its changed files and author, and shows the
 # class as a label, an annotation and a job summary. It is advisory and always passes,
 # so a wrong or failed classification never blocks a merge. Every repository gets it
-# through an org ruleset "require workflow" rule, so it must only ever trigger on PRs.
+# through an org ruleset "require workflow" rule, so it must only ever trigger on PRs and merge queues.
 on:
   pull_request:
+  # A required workflow must also report in a merge queue, or a repository that uses one could never merge.
+  merge_group:
 
 permissions:
   contents: read
@@ -13,15 +15,20 @@ permissions:
 
 concurrency:
   # Queue rather than cancel: GitHub says ruleset workflows must not use cancel-in-progress.
-  group: merge-safety-${{ github.event.pull_request.number }}
+  group: merge-safety-${{ github.event.pull_request.number || github.ref }}
 
 jobs:
   merge-safety:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
+      # The PR was classified when it was opened or pushed, so a merge queue run only has to report.
+      - if: github.event_name == 'merge_group'
+        run: echo "::notice title=Merge safety::Merge queue run. The PR was classified on its last push."
+
       # Reads PR metadata through the API only. Never check out or run PR code here.
       - id: fetch
+        if: github.event_name == 'pull_request'
         continue-on-error: true
         env:
           GH_TOKEN: ${{ github.token }}
@@ -35,6 +42,7 @@ jobs:
 
       # A failure here must not fail the job: the label step then skips and the job still passes.
       - id: classify
+        if: github.event_name == 'pull_request'
         continue-on-error: true
         env:
           FETCH: ${{ steps.fetch.outcome }}

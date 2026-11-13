@@ -1,0 +1,34 @@
+name: Record SDK spec change
+
+# Lambda sends a sdk-spec-changed dispatch when a release changes the SDK spec.
+# This workflow only stores it as state/pending/<tag>.json on the
+# spec-sync-state branch. The daily sdk-spec-sync run picks it up, so many lambda
+# releases in a day still mean at most one SDK update a day.
+on:
+  repository_dispatch:
+    types: [sdk-spec-changed]
+
+permissions:
+  contents: write
+
+# No concurrency group: a group keeps only one pending run and would drop
+# dispatches. commit-state.sh retries instead, and each record is its own file.
+
+jobs:
+  record:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Store the change on the spec-sync-state branch
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.client_payload.tag }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          tools="$GITHUB_WORKSPACE/scripts/spec_sync"
+          bash "$tools/commit-state.sh" "Record $(printf '%s' "$TAG" | tr -cd 'v0-9.') from lambda" -- \
+            python3 "$tools/spec_sync.py" record --event "$GITHUB_EVENT_PATH" --state-dir . --run-url "$RUN_URL"
