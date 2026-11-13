@@ -96,7 +96,8 @@ long_label() {
 }
 europe=$(long_label nightly-integration-tests-for-production-europe.yml)
 us=$(long_label nightly-integration-tests-for-production-us.yml)
-[ ${#europe} -le 50 ] && [ ${#us} -le 50 ] || fail "long labels are over 50 characters: '$europe', '$us'"
+[ ${#europe} -le 50 ] || fail "long label is over 50 characters: '$europe'"
+[ ${#us} -le 50 ] || fail "long label is over 50 characters: '$us'"
 [ "$europe" != "$us" ] || fail "two long names share the label '$us'"
 [ "${us:0:41}" = 'red-lane:nightly-integration-tests-for-pr' ] || fail "long label lost its readable prefix: '$us'"
 
