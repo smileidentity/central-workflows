@@ -119,6 +119,31 @@ jobs:
           git -C "$RUNNER_TEMP/lambda" sparse-checkout set packages/shared
           echo "ref=$ref" >> "$GITHUB_OUTPUT"
 
+      # This job holds SMILE_GHA_BOT's private key, and the next step runs pip,
+      # npx and lambda's code. Take away root first, as sdk-spec-sync.yml does
+      # before Claude runs, so none of them can read the key from the runner's
+      # memory: no passwordless sudo, no Docker socket, and Yama on.
+      - name: Remove root access before running dependencies and lambda's code
+        if: steps.secrets.outputs.configured == 'true'
+        run: |
+          sudo systemctl stop docker.socket docker.service containerd.service 2>/dev/null || true
+          sudo rm -f /var/run/docker.sock /run/containerd/containerd.sock
+          # One sudo call: the rule blocks sudo as soon as it is in place, so no sudo can follow it.
+          # sudoers.d skips file names with a dot, so the .tmp file has no effect until the mv.
+          sudo sh -c 'f=/etc/sudoers.d/zz-persona-sync-no-sudo; printf "%s ALL=(ALL) !ALL\n" "$1" > "$f.tmp" && chmod 0440 "$f.tmp" && visudo -cf "$f.tmp" && mv "$f.tmp" "$f"' sh "$(id -un)"
+          if sudo -n true 2>/dev/null; then
+            echo "::error::sudo still works, so a dependency could read the runner's secrets."
+            exit 1
+          fi
+          if docker info > /dev/null 2>&1; then
+            echo "::error::Docker still runs, so a dependency could get root."
+            exit 1
+          fi
+          if [ "$(cat /proc/sys/kernel/yama/ptrace_scope 2>/dev/null || echo 0)" -lt 1 ]; then
+            echo "::error::kernel.yama.ptrace_scope is 0, so a dependency could read the runner's memory."
+            exit 1
+          fi
+
       - id: sync
         name: Rebuild the personas and cases
         if: steps.secrets.outputs.configured == 'true'
@@ -160,23 +185,53 @@ jobs:
           set -euo pipefail
           repo=smileidentity/smileid-sdk-fixtures
           branch=personas-sync/lambda
+          url="https://github.com/${repo}.git"
+          auth="$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)"
+          export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=http.extraheader GIT_CONFIG_VALUE_0="AUTHORIZATION: basic $auth"
+          pr=$(gh pr list -R "$repo" --head "$branch" --state open --json number --jq '.[0].number // empty')
+
+          # If the open sync PR already has this content, leave it alone: a new
+          # commit would re-run its CI and could dismiss approvals. The recorded
+          # lambda commit is ignored here too.
+          git add personas.json cases
+          if [ -n "$pr" ] && git fetch --quiet "$url" "refs/heads/${branch}:refs/remotes/sync/${branch}" 2>/dev/null \
+             && git diff --cached --quiet "sync/${branch}" -- cases \
+             && git show "sync/${branch}:personas.json" \
+                | jq -e --slurpfile now personas.json 'del(.source) == ($now[0] | del(.source))' > /dev/null 2>&1; then
+            echo "https://github.com/${repo}/pull/${pr} already has these personas and cases. Nothing pushed."
+            exit 0
+          fi
+
           bot_id=$(gh api "/users/${BOT/\[bot\]/%5Bbot%5D}" --jq .id)
           git checkout --quiet -B "$branch"
-          git add personas.json cases
           git -c user.name="$BOT" -c user.email="$bot_id+$BOT@users.noreply.github.com" \
             commit --quiet -m "Sync personas and cases with lambda ${REF}"
-          auth="$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)"
-          git -c http.extraheader="AUTHORIZATION: basic $auth" \
-            push --quiet --force "https://github.com/${repo}.git" "HEAD:refs/heads/${branch}"
+          git push --quiet --force "$url" "HEAD:refs/heads/${branch}"
           body="$(printf '%s\n\n%s\n\n%s\n' \
             "Lambda ${REF} changed the sandbox test identities, so this updates \`personas.json\` and rebuilds \`cases/\` with \`scripts/sync_personas.sh\`." \
             "Review the case changes, then run the cases against dev before merging: \`python scripts/run_cases.py\`." \
             "Opened by the [persona sync](${RUN_URL}). The next run replaces this branch, so don't push to it.")"
-          pr=$(gh pr list -R "$repo" --head "$branch" --state open --json number --jq '.[0].number // empty')
           if [ -n "$pr" ]; then
             gh pr edit "$pr" -R "$repo" --title "Sync personas and cases with lambda ${REF}" --body "$body" > /dev/null
             echo "Updated https://github.com/${repo}/pull/${pr}"
           else
             gh pr create -R "$repo" --head "$branch" --base main \
               --title "Sync personas and cases with lambda ${REF}" --body "$body"
+          fi
+
+      # The fixtures on main match lambda again (for example, lambda reverted a
+      # change), so an open sync PR is out of date. Close it.
+      - name: Close an out-of-date pull request
+        if: steps.sync.outputs.changed == 'false'
+        env:
+          GH_TOKEN: ${{ steps.fixtures-token.outputs.token }}
+          REF: ${{ steps.lambda.outputs.ref }}
+        run: |
+          set -euo pipefail
+          repo=smileidentity/smileid-sdk-fixtures
+          pr=$(gh pr list -R "$repo" --head personas-sync/lambda --state open --json number --jq '.[0].number // empty')
+          if [ -n "$pr" ]; then
+            gh pr close "$pr" -R "$repo" --delete-branch \
+              --comment "Closing: the personas and cases on main already match lambda ${REF}."
+            echo "Closed https://github.com/${repo}/pull/${pr}"
           fi
