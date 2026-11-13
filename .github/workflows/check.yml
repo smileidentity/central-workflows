@@ -32,7 +32,7 @@ jobs:
       - name: Lint workflows and scripts
         run: |
           "$RUNNER_TEMP/actionlint" .github/workflows/*.yml
-          shellcheck scripts/spec_sync/*.sh tests/spec-sync-state.sh
+          shellcheck scripts/spec_sync/*.sh tests/spec-sync-state.sh tests/scheduled-run-status.sh
 
       - name: Test the spec-sync scripts
         run: |
@@ -47,3 +47,6 @@ jobs:
         run: |
           command -v xmllint > /dev/null || { sudo apt-get update -q && sudo apt-get install -yq libxml2-utils; }
           bash tests/deploy-status.sh
+
+      - name: Test the scheduled-run-status workflow
+        run: bash tests/scheduled-run-status.sh
