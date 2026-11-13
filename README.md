@@ -5,6 +5,7 @@ Shared GitHub Actions workflows for Smile Identity's public and private reposito
 - `auto-author-assign.yml` adds the PR author as an assignee when a PR opens or reopens. It skips bot authors and keeps existing assignees.
 - `stale.yml` labels PRs after 14 days without activity and removes the label when activity resumes. It does not mark issues or close issues or PRs.
 - `deploy-status.yml` records what each environment is running. After a deploy it updates a badge for that environment on the calling repository's `deploy-status` branch and, if given a Slack token and canvas, that environment's line on a shared Slack canvas.
+- `scheduled-run-status.yml` keeps one issue open while a scheduled workflow fails. A failed run opens the issue or comments on it, and the next passing run closes it. Given a Slack webhook, it posts each change to Slack too.
 - `sdk-spec-sync-record.yml` and `sdk-spec-sync.yml` keep the V3 server-side SDKs in step with the API spec. They run in this repository only; nothing calls them. See [Sync the SDKs with the API spec](#sync-the-sdks-with-the-api-spec).
 - `merge-safety.yml` sorts each PR into a risk class from its changed files and author, and shows it as a `merge-safety/<class>` label and a job summary. It is advisory and always passes.
 
@@ -62,6 +63,32 @@ The badge for each environment is `<environment>.svg` on the `deploy-status` bra
 The image only loads for people who can read the repository, and only on github.com. The link goes to the environment's deployment history, which exists when the deploy job uses a GitHub environment of that name; otherwise link to the deploy workflow instead.
 
 The Slack step needs a bot token with the `canvases:read` and `canvases:write` scopes, and the bot needs edit access to the canvas. Each environment gets one line under a heading for its repository. The workflow adds the heading and the line on the first deploy and replaces the line after that. A Slack failure shows as a warning and does not fail the job.
+
+## Report scheduled run status
+
+Add a job at the end of the scheduled workflow that needs every other job:
+
+```yaml
+  report:
+    needs: [build, test]
+    if: ${{ !cancelled() }}
+    permissions:
+      issues: write
+    uses: smileidentity/central-workflows/.github/workflows/scheduled-run-status.yml@<full commit SHA from main>
+    with:
+      failed: ${{ contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') }}
+      team: team:api
+    secrets:
+      slack-webhook-url: ${{ secrets.NIGHTLY_SLACK_WEBHOOK_URL }}
+```
+
+List every job in `needs`: a job left out cannot turn the report red. `failed` counts cancelled jobs as well as failed ones, so a job that stops part-way still opens an issue. `!cancelled()` skips the report when someone cancels the whole run. A skipped job counts as a pass, so a job skipped by its own `if:`, such as a check for a missing secret, closes the issue. Make such a guard fail the job instead of skipping it.
+
+The job only acts on `schedule` and `workflow_dispatch` runs of the default branch, so the same workflow can also run on pull requests. A manual run on another branch leaves the issue alone.
+
+It finds the issue by the label `red-lane:<workflow file name without extension>`, and adds the `team` label when it opens one. It creates both labels if they do not exist. A name too long for GitHub's 50-character limit is cut and ends in a short hash of the full name. Do not remove the `red-lane` label from an open issue, or the next failure opens a second one. If you rename the workflow file, close its open issue by hand.
+
+The caller job needs `issues: write`, which works even when the workflow sets tighter defaults. The workflow uses the calling repository's `GITHUB_TOKEN`. The Slack webhook is optional: leave out `secrets` to skip Slack. A Slack failure shows as a warning and does not fail the job.
 
 ## Sync the SDKs with the API spec
 
@@ -128,4 +155,4 @@ Third-party actions inside these workflows are pinned to commit SHAs too. Keep t
 
 ## Check changes
 
-Run `actionlint .github/workflows/*.yml`, `tests/deploy-status.sh` (needs `yq` and `xmllint`), `tests/merge-safety.sh` (needs `yq` and `jq`), `python3 -m unittest discover -s tests` and `tests/spec-sync-state.sh`. The `Check workflows` workflow runs them on every PR. Before updating callers to a new commit, test it here. On a branch, change the pins in `pr-hygiene.yml` to that commit and run `Check shared PR workflows` manually from that branch with `dry-run` enabled. Author assignment uses `pull_request_target`, so it runs from `main`: merge the pin change, then open a PR to check it.
+Run `actionlint .github/workflows/*.yml`, `tests/deploy-status.sh` (needs `yq` and `xmllint`), `tests/merge-safety.sh` (needs `yq` and `jq`), `tests/scheduled-run-status.sh` (needs `yq` and `jq`), `python3 -m unittest discover -s tests` and `tests/spec-sync-state.sh`. The `Check workflows` workflow runs them on every PR. Before updating callers to a new commit, test it here. On a branch, change the pins in `pr-hygiene.yml` to that commit and run `Check shared PR workflows` manually from that branch with `dry-run` enabled. Author assignment uses `pull_request_target`, so it runs from `main`: merge the pin change, then open a PR to check it.
