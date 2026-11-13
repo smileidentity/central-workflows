@@ -107,7 +107,9 @@ jobs:
           url=https://github.com/smileidentity/lambda.git
           ref="$LAMBDA_REF"
           if [ -z "$ref" ]; then
-            ref="$(git ls-remote --tags --refs "$url" 'v3.*' | awk -F/ '{print $3}' | sort -t. -k2,2n -k3,3n | tail -1)"
+            # Only release tags: a suffixed tag such as v3.1169.0-rc1 could otherwise sort last.
+            ref="$(git ls-remote --tags --refs "$url" 'v3.*' | awk -F/ '{print $3}' \
+              | grep -E '^v3\.[0-9]+\.[0-9]+$' | sort -t. -k2,2n -k3,3n | tail -1)"
           fi
           if ! printf '%s' "$ref" | grep -Eq '^v3\.[0-9]+\.[0-9]+$'; then
             echo "::error::'$ref' is not a lambda release tag such as v3.1168.0."
@@ -127,11 +129,17 @@ jobs:
           set -euo pipefail
           pip install --quiet -r requirements-dev.txt
           cp personas.json "$RUNNER_TEMP/personas-before.json"
-          scripts/sync_personas.sh "$RUNNER_TEMP/lambda" > /dev/null
+          # Errors can quote persona values from the private fixtures repository,
+          # and these logs are public, so report only that it failed.
+          if ! scripts/sync_personas.sh "$RUNNER_TEMP/lambda" > /dev/null 2> "$RUNNER_TEMP/sync.err"; then
+            echo "::error::scripts/sync_personas.sh failed. Its output is withheld because the fixtures repository is private. Run it locally against lambda ${REF} to see why."
+            exit 1
+          fi
           # The recorded lambda commit changes with every release; only the rest matters.
+          # git status, unlike git diff, also lists case files the rebuild added.
           if jq -e --slurpfile before "$RUNNER_TEMP/personas-before.json" \
-               'del(.source) == ($before[0] | del(.source))' personas.json > /dev/null \
-             && git diff --quiet -- cases; then
+               'del(.source) == ($before[0] | del(.source))' personas.json > /dev/null 2>&1 \
+             && [ -z "$(git status --porcelain -- cases)" ]; then
             echo "The personas and cases already match lambda ${REF}."
             git checkout --quiet -- personas.json
             echo "changed=false" >> "$GITHUB_OUTPUT"
