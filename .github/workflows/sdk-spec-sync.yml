@@ -265,8 +265,9 @@ jobs:
         run: |
           sudo systemctl stop docker.socket docker.service containerd.service 2>/dev/null || true
           sudo rm -f /var/run/docker.sock /run/containerd/containerd.sock
-          echo "$(id -un) ALL=(ALL) !ALL" | sudo tee /etc/sudoers.d/zz-spec-sync-no-sudo > /dev/null
-          sudo chmod 0440 /etc/sudoers.d/zz-spec-sync-no-sudo
+          # One sudo call: the rule blocks sudo as soon as it is in place, so no sudo can follow it.
+          # sudoers.d skips file names with a dot, so the .tmp file has no effect until the mv.
+          sudo sh -c 'f=/etc/sudoers.d/zz-spec-sync-no-sudo; printf "%s ALL=(ALL) !ALL\n" "$1" > "$f.tmp" && chmod 0440 "$f.tmp" && visudo -cf "$f.tmp" && mv "$f.tmp" "$f"' sh "$(id -un)"
           if sudo -n true 2>/dev/null; then
             echo "::error::sudo still works, so Claude could read the runner's secrets."
             exit 1
