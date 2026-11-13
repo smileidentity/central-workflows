@@ -117,9 +117,9 @@ The workflows need these secrets and variables. Until they exist, the daily run 
   - Claude's step can request its own OIDC token, so no other AWS role may trust this repository.
 - `SPEC_SYNC_BEDROCK_REGION` (variable): the region the role calls Bedrock in, where access to the model is enabled.
 - `SDK_SPEC_SYNC_MODEL` (variable): the Bedrock inference profile ID of the Claude model, such as `global.anthropic.claude-...`. When it changes, update the role's policy first, or the sync fails with `AccessDeniedException`.
-- `SPEC_SYNC_READER_CLIENT_ID` and `SPEC_SYNC_READER_PRIVATE_KEY` (secrets): a GitHub App used by Claude's job, and by the persona sync (see below) to read lambda. Give it contents read and pull requests read access, and nothing else, and install it on the SDK, fixtures and lambda repositories.
+- `SPEC_SYNC_READER_CLIENT_ID` and `SPEC_SYNC_READER_PRIVATE_KEY` (secrets): a GitHub App used by Claude's job, and by the persona sync's build job (see below) to read lambda and the fixtures. Give it contents read and pull requests read access, and nothing else, and install it on the SDK, fixtures and lambda repositories.
 - `SMILE_GHA_BOT_CLIENT_ID` and `SMILE_GHA_BOT_PRIVATE_KEY` (organisation secrets): used by the publish and status jobs here, and by the persona sync. None of these runs Claude, and the persona sync is a separate workflow, so its runner never runs Claude either. An organisation admin must give this repository access to them. The app must be installed on the SDK, fixtures and lambda repositories. It needs contents, pull requests and issues write access on the SDK and fixtures repositories, actions, checks and commit statuses read access, and pull requests read access on lambda. The status job needs actions read because `gh pr list --json statusCheckRollup` reads each check's workflow run.
-- `SPEC_SYNC_BUNDLE_KEY` (secret): the private key that matches `BUNDLE_CERT` in `sdk-spec-sync.yml`. To replace both, run `openssl req -x509 -newkey rsa:4096 -nodes -keyout key.pem -out cert.pem -days 3650 -subj "/CN=central-workflows spec-sync bundle"`. Paste `cert.pem` into the workflow, store `key.pem` as the secret, then delete it.
+- `SPEC_SYNC_BUNDLE_KEY` (secret): the private key that matches `BUNDLE_CERT` in `sdk-spec-sync.yml` and `sdk-fixtures-personas.yml`. To replace them, run `openssl req -x509 -newkey rsa:4096 -nodes -keyout key.pem -out cert.pem -days 3650 -subj "/CN=central-workflows spec-sync bundle"`. Paste `cert.pem` into both workflows, store `key.pem` as the secret, then delete it.
 
 The `spec-sync` and `breaking` labels must exist in every target repository, including `smileid-sdk-fixtures`.
 
@@ -131,9 +131,14 @@ The SDKs' integration cases in `smileid-sdk-fixtures` are generated from lambda'
 
 `sdk-fixtures-personas.yml` runs at 05:15 UTC each day, before the spec sync. It checks out `packages/shared` from lambda's latest release tag, the code sandbox runs, and runs the fixtures repository's `scripts/sync_personas.sh`, which rebuilds `personas.json` and `cases/`. If anything changed apart from the recorded lambda commit, it commits as `SMILE_GHA_BOT` to `personas-sync/lambda` and opens or updates one pull request in `smileid-sdk-fixtures`. Run it by hand with `lambda_ref` to sync from a particular tag.
 
-No model runs in this workflow. It uses the `SPEC_SYNC_READER` app to read lambda, and `SMILE_GHA_BOT` (contents and pull requests write on `smileid-sdk-fixtures`) to publish. The job holds the bot's private key while it runs pip, npx and lambda's code, so it first turns off passwordless sudo and stops Docker, as the spec sync does before Claude runs. It prints only file names, because this repository's logs are public and the fixtures repository is private.
+No model runs in this workflow. It has two jobs, split the same way as the spec sync's `sync` and `publish` jobs:
 
-When the open sync PR already has the rebuilt content, the workflow pushes nothing, so CI doesn't re-run and approvals stay. When the fixtures on `main` match lambda again, it closes the open sync PR.
+- The build job runs pip, npx and lambda's code with read-only tokens from `SPEC_SYNC_READER`, for lambda and the fixtures repository. It turns off passwordless sudo and stops Docker first, because the runner holds the reader app's key. It hands `personas.json` and `cases/` to the publish job encrypted to `BUNDLE_CERT`, because this repository's artifacts are public.
+- The publish job runs on a fresh runner with `SMILE_GHA_BOT` (contents and pull requests write on `smileid-sdk-fixtures`) and runs only `git`, `gh`, `tar`, `openssl` and `jq`. It accepts the bundle only if it holds plain files named `personas.json` or `cases/<operationId>.json`, all valid JSON. So code that runs in the build job can't reach the bot's key or token.
+
+The workflow prints only file names, because this repository's logs are public and the fixtures repository is private.
+
+When the open sync PR already has the rebuilt content, the workflow pushes nothing, so CI doesn't re-run and approvals stay. When the fixtures on `main` match lambda again, it closes the open sync PR. Closing a sync PR yourself doesn't stop the sync: while `main` differs from lambda, the next run opens a new one. To keep the fixtures from following a lambda change, change lambda's identities, not the fixtures.
 
 ## Merge safety
 

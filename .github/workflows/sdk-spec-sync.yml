@@ -262,14 +262,16 @@ jobs:
       # release tags. Record what the checkout holds before and after Claude, so
       # the log shows whether something made it shallow.
       - name: Record the checkout's history before Claude runs
+        env:
+          # The default branch's head, which the prepare step looked up by name.
+          DEFAULT_SHA: ${{ steps.prepare.outputs.default_sha }}
         run: |
           echo "shallow: $(git rev-parse --is-shallow-repository)"
           echo "tags: $(git tag -l | wc -l)"
-          default="$(git symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null || echo origin/main)"
-          if git merge-base HEAD "$default" > /dev/null 2>&1; then
-            echo "merge base with ${default}: found"
+          if git merge-base HEAD "$DEFAULT_SHA" > /dev/null 2>&1; then
+            echo "merge base with the default branch: found"
           else
-            echo "merge base with ${default}: missing"
+            echo "merge base with the default branch: missing"
           fi
 
       # The runner process holds this job's secrets in memory. Take away the ways

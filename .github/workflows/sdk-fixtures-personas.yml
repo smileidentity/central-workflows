@@ -8,9 +8,14 @@ name: Sync SDK fixture personas
 # update one pull request. A change to the recorded lambda commit alone is
 # ignored, so a lambda release that doesn't touch the identities makes no PR.
 #
-# No model runs here. The personas are copied by a fixed script, and nothing
-# from them is printed, because this repository's logs are public and
-# smileid-sdk-fixtures is private.
+# Two jobs, as in sdk-spec-sync.yml. The build job runs pip, npx and lambda's
+# code with read tokens only, and hands over personas.json and cases/ encrypted
+# to BUNDLE_CERT, because this repository's artifacts are public and
+# smileid-sdk-fixtures is private. The publish job, on a fresh runner, holds the
+# bot token and runs only git, gh, tar, openssl and jq on the checked bundle.
+#
+# No model runs here, and nothing from the personas is printed, because this
+# repository's logs are public.
 on:
   schedule:
     - cron: '15 5 * * *' # daily, before the 06:00 spec sync
@@ -28,11 +33,14 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  sync:
+  build:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
       contents: read
+    outputs:
+      configured: ${{ steps.secrets.outputs.configured }}
+      ref: ${{ steps.lambda.outputs.ref }}
     steps:
       - id: secrets
         name: Check the secrets are set
@@ -41,12 +49,14 @@ jobs:
           BOT_PRIVATE_KEY: ${{ secrets.SMILE_GHA_BOT_PRIVATE_KEY }}
           READER_CLIENT_ID: ${{ secrets.SPEC_SYNC_READER_CLIENT_ID }}
           READER_PRIVATE_KEY: ${{ secrets.SPEC_SYNC_READER_PRIVATE_KEY }}
+          BUNDLE_KEY: ${{ secrets.SPEC_SYNC_BUNDLE_KEY }}
         run: |
           missing=()
           [ -n "$BOT_CLIENT_ID" ] || missing+=("SMILE_GHA_BOT_CLIENT_ID secret")
           [ -n "$BOT_PRIVATE_KEY" ] || missing+=("SMILE_GHA_BOT_PRIVATE_KEY secret")
           [ -n "$READER_CLIENT_ID" ] || missing+=("SPEC_SYNC_READER_CLIENT_ID secret")
           [ -n "$READER_PRIVATE_KEY" ] || missing+=("SPEC_SYNC_READER_PRIVATE_KEY secret")
+          [ -n "$BUNDLE_KEY" ] || missing+=("SPEC_SYNC_BUNDLE_KEY secret")
           if [ ${#missing[@]} -gt 0 ]; then
             joined="$(printf '%s, ' "${missing[@]}")"
             echo "::warning::Persona sync is not set up yet. This repository is missing: ${joined%, }."
@@ -55,32 +65,22 @@ jobs:
             echo "configured=true" >> "$GITHUB_OUTPUT"
           fi
 
-      - id: lambda-token
+      # Read only: lambda for the identities, and the fixtures for the script.
+      - id: read-token
         if: steps.secrets.outputs.configured == 'true'
         uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
         with:
           client-id: ${{ secrets.SPEC_SYNC_READER_CLIENT_ID }}
           private-key: ${{ secrets.SPEC_SYNC_READER_PRIVATE_KEY }}
           owner: smileidentity
-          repositories: lambda
+          repositories: lambda,smileid-sdk-fixtures
           permission-contents: read
-
-      - id: fixtures-token
-        if: steps.secrets.outputs.configured == 'true'
-        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
-        with:
-          client-id: ${{ secrets.SMILE_GHA_BOT_CLIENT_ID }}
-          private-key: ${{ secrets.SMILE_GHA_BOT_PRIVATE_KEY }}
-          owner: smileidentity
-          repositories: smileid-sdk-fixtures
-          permission-contents: write
-          permission-pull-requests: write
 
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         if: steps.secrets.outputs.configured == 'true'
         with:
           repository: smileidentity/smileid-sdk-fixtures
-          token: ${{ steps.fixtures-token.outputs.token }}
+          token: ${{ steps.read-token.outputs.token }}
           path: fixtures
           persist-credentials: false
 
@@ -98,7 +98,7 @@ jobs:
         name: Check out lambda's shared package at the release
         if: steps.secrets.outputs.configured == 'true'
         env:
-          TOKEN: ${{ steps.lambda-token.outputs.token }}
+          TOKEN: ${{ steps.read-token.outputs.token }}
           LAMBDA_REF: ${{ inputs.lambda_ref }}
         run: |
           set -euo pipefail
@@ -119,10 +119,10 @@ jobs:
           git -C "$RUNNER_TEMP/lambda" sparse-checkout set packages/shared
           echo "ref=$ref" >> "$GITHUB_OUTPUT"
 
-      # This job holds SMILE_GHA_BOT's private key, and the next step runs pip,
-      # npx and lambda's code. Take away root first, as sdk-spec-sync.yml does
-      # before Claude runs, so none of them can read the key from the runner's
-      # memory: no passwordless sudo, no Docker socket, and Yama on.
+      # The runner holds the reader app's key, which can read lambda and the
+      # SDKs. Take away root before pip, npx and lambda's code run, as
+      # sdk-spec-sync.yml does before Claude: no passwordless sudo, no Docker
+      # socket, and Yama on.
       - name: Remove root access before running dependencies and lambda's code
         if: steps.secrets.outputs.configured == 'true'
         run: |
@@ -144,8 +144,7 @@ jobs:
             exit 1
           fi
 
-      - id: sync
-        name: Rebuild the personas and cases
+      - name: Rebuild the personas and cases
         if: steps.secrets.outputs.configured == 'true'
         working-directory: fixtures
         env:
@@ -153,20 +152,136 @@ jobs:
         run: |
           set -euo pipefail
           pip install --quiet -r requirements-dev.txt
-          cp personas.json "$RUNNER_TEMP/personas-before.json"
           # Errors can quote persona values from the private fixtures repository,
           # and these logs are public, so report only that it failed.
           if ! scripts/sync_personas.sh "$RUNNER_TEMP/lambda" > /dev/null 2> "$RUNNER_TEMP/sync.err"; then
             echo "::error::scripts/sync_personas.sh failed. Its output is withheld because the fixtures repository is private. Run it locally against lambda ${REF} to see why."
             exit 1
           fi
+
+      - name: Bundle the personas and cases for the publish job
+        if: steps.secrets.outputs.configured == 'true'
+        working-directory: fixtures
+        env:
+          BUNDLE_CERT: |
+            -----BEGIN CERTIFICATE-----
+            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
+            FHw+YXMkDAd2/xkUDIU=
+            -----END CERTIFICATE-----
+        run: |
+          set -euo pipefail
+          printf '%s\n' "$BUNDLE_CERT" > "$RUNNER_TEMP/bundle-cert.pem"
+          tar -cf "$RUNNER_TEMP/bundle.tar" personas.json cases/*.json
+          mkdir -p "$RUNNER_TEMP/upload"
+          openssl cms -encrypt -binary -aes256 -outform DER -in "$RUNNER_TEMP/bundle.tar" \
+            -out "$RUNNER_TEMP/upload/bundle.cms" "$RUNNER_TEMP/bundle-cert.pem"
+
+      - if: steps.secrets.outputs.configured == 'true'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: personas-bundle
+          path: ${{ runner.temp }}/upload/bundle.cms
+          retention-days: 1
+
+  publish:
+    needs: build
+    if: needs.build.outputs.configured == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      # A fresh runner: nothing here comes from the build job except the
+      # encrypted bundle, which is checked before use, and the tag name, which
+      # is checked against the release pattern.
+      - id: fixtures-token
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ secrets.SMILE_GHA_BOT_CLIENT_ID }}
+          private-key: ${{ secrets.SMILE_GHA_BOT_PRIVATE_KEY }}
+          owner: smileidentity
+          repositories: smileid-sdk-fixtures
+          permission-contents: write
+          permission-pull-requests: write
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: smileidentity/smileid-sdk-fixtures
+          token: ${{ steps.fixtures-token.outputs.token }}
+          path: fixtures
+          persist-credentials: false
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: personas-bundle
+          path: ${{ runner.temp }}/download
+
+      - id: apply
+        name: Check the bundle and apply it
+        working-directory: fixtures
+        env:
+          BUNDLE_KEY: ${{ secrets.SPEC_SYNC_BUNDLE_KEY }}
+          REF: ${{ needs.build.outputs.ref }}
+        run: |
+          set -euo pipefail
+          if ! printf '%s' "$REF" | grep -Eq '^v3\.[0-9]+\.[0-9]+$'; then
+            echo "::error::The build job reported '$REF', which is not a lambda release tag."
+            exit 1
+          fi
+          key="$RUNNER_TEMP/bundle-key.pem"
+          (umask 077 && printf '%s\n' "$BUNDLE_KEY" > "$key")
+          openssl cms -decrypt -binary -inform DER -in "$RUNNER_TEMP/download/bundle.cms" -inkey "$key" \
+            -out "$RUNNER_TEMP/bundle.tar"
+          rm -f "$key"
+          # Plain files only, named personas.json or cases/<operationId>.json.
+          if tar -tvf "$RUNNER_TEMP/bundle.tar" | grep -qv '^-' \
+             || tar -tf "$RUNNER_TEMP/bundle.tar" | grep -qvE '^(personas\.json|cases/[A-Za-z0-9_]+\.json)$' \
+             || ! tar -tf "$RUNNER_TEMP/bundle.tar" | grep -qx 'personas.json'; then
+            echo "::error::The bundle holds something other than personas.json and cases/<operationId>.json, so nothing was published."
+            exit 1
+          fi
+          cp personas.json "$RUNNER_TEMP/personas-before.json"
+          # Replace the cases, so a case the rebuild dropped is removed here too.
+          rm -f cases/*.json
+          tar --no-same-owner --no-same-permissions -xf "$RUNNER_TEMP/bundle.tar"
+          for f in personas.json cases/*.json; do
+            if ! jq empty "$f" > /dev/null 2>&1; then
+              echo "::error::The bundle holds a file that isn't valid JSON, so nothing was published."
+              exit 1
+            fi
+          done
           # The recorded lambda commit changes with every release; only the rest matters.
           # git status, unlike git diff, also lists case files the rebuild added.
           if jq -e --slurpfile before "$RUNNER_TEMP/personas-before.json" \
                'del(.source) == ($before[0] | del(.source))' personas.json > /dev/null 2>&1 \
              && [ -z "$(git status --porcelain -- cases)" ]; then
             echo "The personas and cases already match lambda ${REF}."
-            git checkout --quiet -- personas.json
             echo "changed=false" >> "$GITHUB_OUTPUT"
           else
             git status --short
@@ -174,12 +289,12 @@ jobs:
           fi
 
       - name: Open or update the pull request
-        if: steps.sync.outputs.changed == 'true'
+        if: steps.apply.outputs.changed == 'true'
         working-directory: fixtures
         env:
           GH_TOKEN: ${{ steps.fixtures-token.outputs.token }}
           BOT: ${{ steps.fixtures-token.outputs.app-slug }}[bot]
-          REF: ${{ steps.lambda.outputs.ref }}
+          REF: ${{ needs.build.outputs.ref }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           set -euo pipefail
@@ -193,7 +308,7 @@ jobs:
           # If the open sync PR already has this content, leave it alone: a new
           # commit would re-run its CI and could dismiss approvals. The recorded
           # lambda commit is ignored here too.
-          git add personas.json cases
+          git add -A personas.json cases
           if [ -n "$pr" ] && git fetch --quiet "$url" "refs/heads/${branch}:refs/remotes/sync/${branch}" 2>/dev/null \
              && git diff --cached --quiet "sync/${branch}" -- cases \
              && git show "sync/${branch}:personas.json" \
@@ -210,7 +325,7 @@ jobs:
           body="$(printf '%s\n\n%s\n\n%s\n' \
             "Lambda ${REF} changed the sandbox test identities, so this updates \`personas.json\` and rebuilds \`cases/\` with \`scripts/sync_personas.sh\`." \
             "Review the case changes, then run the cases against dev before merging: \`python scripts/run_cases.py\`." \
-            "Opened by the [persona sync](${RUN_URL}). The next run replaces this branch, so don't push to it.")"
+            "Opened by the [persona sync](${RUN_URL}). The next run replaces this branch, so don't push to it. Closing this PR doesn't stop the sync: the next run opens a new one while main differs from lambda.")"
           if [ -n "$pr" ]; then
             gh pr edit "$pr" -R "$repo" --title "Sync personas and cases with lambda ${REF}" --body "$body" > /dev/null
             echo "Updated https://github.com/${repo}/pull/${pr}"
@@ -222,10 +337,10 @@ jobs:
       # The fixtures on main match lambda again (for example, lambda reverted a
       # change), so an open sync PR is out of date. Close it.
       - name: Close an out-of-date pull request
-        if: steps.sync.outputs.changed == 'false'
+        if: steps.apply.outputs.changed == 'false'
         env:
           GH_TOKEN: ${{ steps.fixtures-token.outputs.token }}
-          REF: ${{ steps.lambda.outputs.ref }}
+          REF: ${{ needs.build.outputs.ref }}
         run: |
           set -euo pipefail
           repo=smileidentity/smileid-sdk-fixtures
