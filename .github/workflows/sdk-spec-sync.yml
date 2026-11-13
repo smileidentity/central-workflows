@@ -504,6 +504,8 @@ jobs:
           permission-pull-requests: write
           permission-checks: read
           permission-statuses: read
+          # gh pr list --json statusCheckRollup reads each check's workflow run.
+          permission-actions: read
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
