@@ -611,16 +611,22 @@ def prepare(*, u, repo, workdir, ctx, state_dir, template, token, read_token):
 
 
 SDK_NOTE = (
-    "Persona cases live in the private `smileid-sdk-fixtures` repository. A read-only copy is at "
-    "`{ctx}/fixtures` if this run could read it. Another job in this run updates that repository, so do not "
-    "edit it. If the integration suite here needs a change to run new cases (for example, mapping a new "
-    "operationId to an SDK method), make it, and list the persona cases the change needs in your summary."
+    "The integration cases live in the private `smileid-sdk-fixtures` repository, as "
+    "`cases/<operationId>.json`. They are generated from lambda's sandbox test identities, so they always "
+    "match what sandbox returns. A read-only copy is at `{ctx}/fixtures` if this run could read it. Another "
+    "job in this run updates that repository, so do not edit it. If the integration suite here needs a "
+    "change to run the cases for an operation you add (for example, mapping its operationId to an SDK "
+    "method), make it. Do not list persona cases as a gap: an operation that has a cases file is covered. "
+    "Only if an operation you add has no cases file, say so in your summary."
 )
 FIXTURES_NOTE = (
-    "This repository holds the shared persona cases. Follow its README: change `operations.json` (and "
-    "`personas.json` only if lambda's test identities changed), rebuild with `python scripts/build_cases.py`, "
-    "and run `python scripts/validate.py`. You cannot run the cases against dev here, so say so in your summary. "
-    "There are no golden fixtures or coverage gates in this repository."
+    "This repository holds the shared integration cases. `personas.json` and `cases/` are generated: "
+    "`personas.json` comes from lambda's sandbox test identities through `scripts/sync_personas.sh`, which a "
+    "separate daily workflow runs, so never edit `personas.json` or `cases/` by hand. Follow the README: if an "
+    "operation's inputs changed or there is a new operation that takes a persona, change `operations.json`, "
+    "rebuild with `python scripts/build_cases.py`, and run `python scripts/validate.py`. You cannot run the "
+    "cases against dev here, so say so in your summary. There are no golden fixtures or coverage gates in "
+    "this repository."
 )
 
 
