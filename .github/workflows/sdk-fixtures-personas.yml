@@ -350,3 +350,16 @@ jobs:
               --comment "Closing: the personas and cases on main already match lambda ${REF}."
             echo "Closed https://github.com/${repo}/pull/${pr}"
           fi
+
+  # Nobody watches a daily run, so a failure opens (or comments on) an issue
+  # here, and the next passing run closes it. See "Report scheduled run status"
+  # in the README.
+  report:
+    needs: [build, publish]
+    if: ${{ !cancelled() }}
+    permissions:
+      issues: write
+    uses: ./.github/workflows/scheduled-run-status.yml
+    with:
+      failed: ${{ contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') }}
+      team: team:sdk

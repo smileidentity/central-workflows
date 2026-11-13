@@ -140,6 +140,8 @@ The workflow prints only file names, because this repository's logs are public a
 
 When the open sync PR already has the rebuilt content, the workflow pushes nothing, so CI doesn't re-run and approvals stay. When the fixtures on `main` match lambda again, it closes the open sync PR. Closing a sync PR yourself doesn't stop the sync: while `main` differs from lambda, the next run opens a new one. To keep the fixtures from following a lambda change, change lambda's identities, not the fixtures.
 
+A failed run opens an issue here labelled `red-lane:sdk-fixtures-personas` and `team:sdk`, through the scheduled run status workflow above. The next passing run closes it.
+
 ## Merge safety
 
 `merge-safety.yml` has no caller. An org ruleset with a "require workflow" rule runs it on every PR, pinned to a commit SHA from `main`. The ruleset is in evaluate mode, so GitHub runs the workflow but never blocks a merge on it.
