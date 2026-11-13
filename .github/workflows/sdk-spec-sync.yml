@@ -147,7 +147,7 @@ jobs:
           repositories: ${{ matrix.repo }}
           permission-contents: read
           permission-pull-requests: read
-          # A post step would run after Claude with the private key as an input.
+          # Don't revoke the token: it expires after an hour.
           skip-token-revoke: true
 
       # Read-only, for lambda PR descriptions and the persona cases. The job carries on without them.
@@ -160,7 +160,7 @@ jobs:
           owner: smileidentity
           repositories: lambda
           permission-pull-requests: read
-          # A post step would run after Claude with the private key as an input.
+          # Don't revoke the token: it expires after an hour.
           skip-token-revoke: true
       - id: fixtures-token
         if: matrix.repo != 'smileid-sdk-fixtures'
@@ -172,7 +172,7 @@ jobs:
           owner: smileidentity
           repositories: smileid-sdk-fixtures
           permission-contents: read
-          # A post step would run after Claude with the private key as an input.
+          # Don't revoke the token: it expires after an hour.
           skip-token-revoke: true
 
       # Claude works in the workspace root, so everything else lives in RUNNER_TEMP.
