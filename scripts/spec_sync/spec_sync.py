@@ -617,7 +617,9 @@ SDK_NOTE = (
     "job in this run updates that repository, so do not edit it. If the integration suite here needs a "
     "change to run the cases for an operation you add (for example, mapping its operationId to an SDK "
     "method), make it. Do not list persona cases as a gap: an operation that has a cases file is covered. "
-    "Only if an operation you add has no cases file, say so in your summary."
+    "Only if an operation you add has no cases file, say so in your summary, not as a gap: the cases are "
+    "generated from sandbox, so this run can't add one. A lookup on an existing job, such as a GET for its "
+    "status or news, needs no cases file of its own."
 )
 FIXTURES_NOTE = (
     "This repository holds the shared integration cases. `personas.json` and `cases/` are generated: "
