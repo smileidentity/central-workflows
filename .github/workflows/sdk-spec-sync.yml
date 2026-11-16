@@ -225,6 +225,12 @@ jobs:
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version: stable
+      - if: matrix.repo == 'smileid-sdk-go'
+        uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
+        with:
+          # Install only; Claude runs it. Keep in step with smileid-sdk-go's test.yml.
+          version: v2.14.0
+          install-only: true
       - if: matrix.repo == 'smileid-sdk-java'
         uses: actions/setup-java@77dd5b2ce225ea11469928ac317850245a74ae78 # v6.2.0
         with:
