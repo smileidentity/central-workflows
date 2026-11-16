@@ -58,6 +58,7 @@ Write two files.
 - `status` is `changed` if you changed files, `no_change` if nothing needed changing, or `blocked` if you could not finish the change or could not get every check to pass.
 - `checks` lists every check you ran, and whether it passed on your final run.
 - `changed_line_coverage` is the changed-line coverage percentage, or `null` if you could not measure it.
-- `gaps` lists, in plain English, anything you could not do: failing checks, uncovered lines, changes left out because they would break the public API, or persona cases that still need adding. Leave it empty only if everything is done.
+- `gaps` lists, in plain English, anything you could not do: failing checks, uncovered lines, changes left out because they would break the public API, or a new operation with no cases file in `smileid-sdk-fixtures`. Leave it empty only if everything is done.
+- This checkout has the repository's full history and tags, so compare with `origin/{{default_branch}}` for changed-line coverage, and with the latest release tag for API compatibility. If either is missing, report it as a gap and say which git command failed.
 
-`{{ctx}}/out/summary.md`, in Markdown, for the pull request description. Write it for the SDK's maintainers in plain English and short sentences. Say what changed in the public API and why, which tests you added, and which persona cases the integration suite needs. Do not use headings above level 3. Do not include anything confidential.
+`{{ctx}}/out/summary.md`, in Markdown, for the pull request description. Write it for the SDK's maintainers in plain English and short sentences. Say what changed in the public API and why, which tests you added, and which `smileid-sdk-fixtures` cases files cover the operations you changed. Do not use headings above level 3. Do not include anything confidential.
