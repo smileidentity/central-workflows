@@ -8,9 +8,10 @@ name: Sync SDK fixture personas
 # update one pull request. A change to the recorded lambda commit alone is
 # ignored, so a lambda release that doesn't touch the identities makes no PR.
 #
-# Two jobs, as in sdk-spec-sync.yml. The build job runs pip, npx and lambda's
-# code with read tokens only, and hands over personas.json and cases/ encrypted
-# to BUNDLE_CERT, because this repository's artifacts are public and
+# As in sdk-spec-sync.yml, a plan job checks the secrets are set, so the build
+# job never receives the bot's key or the bundle key. The build job runs pip,
+# npx and lambda's code with read tokens only, and hands over personas.json and
+# cases/ encrypted to BUNDLE_CERT, because this repository's artifacts are public and
 # smileid-sdk-fixtures is private. The publish job, on a fresh runner, holds the
 # bot token and runs only git, gh, tar, openssl and jq on the checked bundle.
 #
@@ -33,14 +34,14 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  build:
+  # Checks the secrets in a job of its own, as sdk-spec-sync.yml's plan job
+  # does, so the build job's runner never receives the bot's key or the bundle key.
+  plan:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
-    permissions:
-      contents: read
+    timeout-minutes: 5
+    permissions: {}
     outputs:
       configured: ${{ steps.secrets.outputs.configured }}
-      ref: ${{ steps.lambda.outputs.ref }}
     steps:
       - id: secrets
         name: Check the secrets are set
@@ -65,9 +66,18 @@ jobs:
             echo "configured=true" >> "$GITHUB_OUTPUT"
           fi
 
+  build:
+    needs: plan
+    if: needs.plan.outputs.configured == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    outputs:
+      ref: ${{ steps.lambda.outputs.ref }}
+    steps:
       # Read only: lambda for the identities, and the fixtures for the script.
       - id: read-token
-        if: steps.secrets.outputs.configured == 'true'
         uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
         with:
           client-id: ${{ secrets.SPEC_SYNC_READER_CLIENT_ID }}
@@ -77,7 +87,6 @@ jobs:
           permission-contents: read
 
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        if: steps.secrets.outputs.configured == 'true'
         with:
           repository: smileidentity/smileid-sdk-fixtures
           token: ${{ steps.read-token.outputs.token }}
@@ -85,18 +94,15 @@ jobs:
           persist-credentials: false
 
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
-        if: steps.secrets.outputs.configured == 'true'
         with:
           node-version: '24'
 
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
-        if: steps.secrets.outputs.configured == 'true'
         with:
           python-version: '3.12'
 
       - id: lambda
         name: Check out lambda's shared package at the release
-        if: steps.secrets.outputs.configured == 'true'
         env:
           TOKEN: ${{ steps.read-token.outputs.token }}
           LAMBDA_REF: ${{ inputs.lambda_ref }}
@@ -124,7 +130,6 @@ jobs:
       # sdk-spec-sync.yml does before Claude: no passwordless sudo, no Docker
       # socket, and Yama on.
       - name: Remove root access before running dependencies and lambda's code
-        if: steps.secrets.outputs.configured == 'true'
         run: |
           sudo systemctl stop docker.socket docker.service containerd.service 2>/dev/null || true
           sudo rm -f /var/run/docker.sock /run/containerd/containerd.sock
@@ -145,7 +150,6 @@ jobs:
           fi
 
       - name: Rebuild the personas and cases
-        if: steps.secrets.outputs.configured == 'true'
         working-directory: fixtures
         env:
           REF: ${{ steps.lambda.outputs.ref }}
@@ -160,7 +164,6 @@ jobs:
           fi
 
       - name: Bundle the personas and cases for the publish job
-        if: steps.secrets.outputs.configured == 'true'
         working-directory: fixtures
         env:
           BUNDLE_CERT: |
@@ -202,16 +205,15 @@ jobs:
           openssl cms -encrypt -binary -aes256 -outform DER -in "$RUNNER_TEMP/bundle.tar" \
             -out "$RUNNER_TEMP/upload/bundle.cms" "$RUNNER_TEMP/bundle-cert.pem"
 
-      - if: steps.secrets.outputs.configured == 'true'
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: personas-bundle
           path: ${{ runner.temp }}/upload/bundle.cms
           retention-days: 1
 
   publish:
-    needs: build
-    if: needs.build.outputs.configured == 'true'
+    needs: [plan, build]
+    if: needs.plan.outputs.configured == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -260,16 +262,39 @@ jobs:
             -out "$RUNNER_TEMP/bundle.tar"
           rm -f "$key"
           # Plain files only, named personas.json or cases/<operationId>.json.
-          if tar -tvf "$RUNNER_TEMP/bundle.tar" | grep -qv '^-' \
-             || tar -tf "$RUNNER_TEMP/bundle.tar" | grep -qvE '^(personas\.json|cases/[A-Za-z0-9_]+\.json)$' \
-             || ! tar -tf "$RUNNER_TEMP/bundle.tar" | grep -qx 'personas.json'; then
+          # List into files and grep those: with pipefail, a grep -q that stops
+          # early makes tar exit on SIGPIPE, and the pipeline would then pass.
+          tar -tvf "$RUNNER_TEMP/bundle.tar" > "$RUNNER_TEMP/bundle-long.txt"
+          tar -tf "$RUNNER_TEMP/bundle.tar" > "$RUNNER_TEMP/bundle-names.txt"
+          bad() {
             echo "::error::The bundle holds something other than personas.json and cases/<operationId>.json, so nothing was published."
             exit 1
+          }
+          if grep -qv '^-' "$RUNNER_TEMP/bundle-long.txt" \
+             || grep -qvE '^(personas\.json|cases/[A-Za-z0-9_]+\.json)$' "$RUNNER_TEMP/bundle-names.txt" \
+             || ! grep -qx 'personas.json' "$RUNNER_TEMP/bundle-names.txt"; then
+            bad
+          fi
+          # Extract outside the checkout, check again what landed, and copy in
+          # only the expected files, so nothing can reach .git even if a check
+          # above is wrong.
+          extract="$RUNNER_TEMP/bundle"
+          mkdir "$extract"
+          tar -C "$extract" --no-same-owner --no-same-permissions -xf "$RUNNER_TEMP/bundle.tar"
+          if [ -n "$(cd "$extract" && find . -mindepth 1 ! -path ./cases ! -path ./personas.json \
+                ! -regex '\./cases/[A-Za-z0-9_]+\.json' -print -quit)" ] \
+             || [ -n "$(cd "$extract" && find . -mindepth 1 ! -type f ! -path ./cases -print -quit)" ] \
+             || [ -L "$extract/cases" ] || [ -L "$extract/personas.json" ] \
+             || [ ! -f "$extract/personas.json" ]; then
+            bad
           fi
           cp personas.json "$RUNNER_TEMP/personas-before.json"
           # Replace the cases, so a case the rebuild dropped is removed here too.
           rm -f cases/*.json
-          tar --no-same-owner --no-same-permissions -xf "$RUNNER_TEMP/bundle.tar"
+          cp "$extract/personas.json" personas.json
+          if [ -d "$extract/cases" ]; then
+            find "$extract/cases" -maxdepth 1 -type f -name '*.json' -exec cp {} cases/ \;
+          fi
           for f in personas.json cases/*.json; do
             if ! jq empty "$f" > /dev/null 2>&1; then
               echo "::error::The bundle holds a file that isn't valid JSON, so nothing was published."
@@ -355,7 +380,7 @@ jobs:
   # here, and the next passing run closes it. See "Report scheduled run status"
   # in the README.
   report:
-    needs: [build, publish]
+    needs: [plan, build, publish]
     if: ${{ !cancelled() }}
     permissions:
       issues: write

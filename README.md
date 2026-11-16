@@ -133,8 +133,8 @@ The SDKs' integration cases in `smileid-sdk-fixtures` are generated from lambda'
 
 No model runs in this workflow. It has two jobs, split the same way as the spec sync's `sync` and `publish` jobs:
 
-- The build job runs pip, npx and lambda's code with read-only tokens from `SPEC_SYNC_READER`, for lambda and the fixtures repository. It turns off passwordless sudo and stops Docker first, because the runner holds the reader app's key. It hands `personas.json` and `cases/` to the publish job encrypted to `BUNDLE_CERT`, because this repository's artifacts are public.
-- The publish job runs on a fresh runner with `SMILE_GHA_BOT` (contents and pull requests write on `smileid-sdk-fixtures`) and runs only `git`, `gh`, `tar`, `openssl` and `jq`. It accepts the bundle only if it holds plain files named `personas.json` or `cases/<operationId>.json`, all valid JSON. So code that runs in the build job can't reach the bot's key or token.
+- The build job runs pip, npx and lambda's code with read-only tokens from `SPEC_SYNC_READER`, for lambda and the fixtures repository. It turns off passwordless sudo and stops Docker first, because the runner holds the reader app's key. It never gets the bot's key or the bundle key: a small plan job checks those secrets are set. It hands `personas.json` and `cases/` to the publish job encrypted to `BUNDLE_CERT`, because this repository's artifacts are public.
+- The publish job runs on a fresh runner with `SMILE_GHA_BOT` (contents and pull requests write on `smileid-sdk-fixtures`) and runs only `git`, `gh`, `tar`, `openssl` and `jq`. It accepts the bundle only if it holds plain files named `personas.json` or `cases/<operationId>.json`, all valid JSON. It checks the archive's listing, extracts into an empty directory outside the checkout, checks what landed, and copies in only those files, so nothing can reach `.git`. So code that runs in the build job can't reach the bot's key or token.
 
 The workflow prints only file names, because this repository's logs are public and the fixtures repository is private.
 
