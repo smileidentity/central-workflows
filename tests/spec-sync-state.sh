@@ -44,6 +44,14 @@ bash "$tools/commit-state.sh" "Mark processed" -- \
 [ "$(files)" = "state/pending/v3.4.0.json state/pending/v3.5.0.json state/processed/v3.2.0.json state/processed/v3.3.0.json " ] \
   || fail "mark processed: $(files)"
 
+# A run that synced some repositories records them and leaves the release pending.
+bash "$tools/commit-state.sh" "Mark go processed" -- \
+  python3 "$tools/spec_sync.py" mark-processed --state-dir . --matrix '{"include": []}' \
+  --settled '{"smileid-sdk-go": ["v3.4.0"]}' --run-url "$run_url" > /dev/null
+files | grep -q "state/pending/v3.4.0.json" || fail "v3.4.0 should stay pending: $(files)"
+done_repos=$(git --git-dir "$remote" show spec-sync-state:state/pending/v3.4.0.json | jq -c '.processed_repos | keys')
+[ "$done_repos" = '["smileid-sdk-go"]' ] || fail "v3.4.0 should be processed for go only: $done_repos"
+
 # A repeat of a processed release changes nothing.
 before=$(git --git-dir "$remote" rev-parse spec-sync-state)
 out=$(dispatch v3.2.0 v3.1.0)

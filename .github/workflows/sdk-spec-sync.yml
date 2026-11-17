@@ -17,7 +17,7 @@ name: SDK spec sync
 # clones the SDK again, checks the patch and pushes it.
 on:
   schedule:
-    - cron: '0 6 * * *' # daily sync; keep in step with SYNC_CRON below
+    - cron: '0 6 * * *' # daily sync; keep in step with SYNC_CRON and the concurrency group below (tests/test_workflows.py checks)
     - cron: '30 * * * *' # hourly: mark green PRs ready and update the status issue
   workflow_dispatch:
     inputs:
@@ -30,7 +30,7 @@ on:
         type: string
         default: ''
       repos:
-        description: Optional comma-separated repositories, such as "go,python" or "fixtures". Default is all. Pending releases stay pending unless every repository runs.
+        description: Optional comma-separated repositories, such as "go,python" or "fixtures". Default is all. Each repository that syncs is marked done for the pending releases it covered.
         type: string
         default: ''
 
@@ -41,6 +41,11 @@ env:
   SYNC_CRON: '0 6 * * *'
 
 # Hourly status runs must not replace a queued sync run, so they get their own group.
+# Daily and manual syncs share one group, because two syncs at once would push to
+# the same spec-sync branches. GitHub keeps only one waiting run per group: a newer
+# run replaces a waiting one, which shows as cancelled. The plan job's "Look for
+# replaced runs" step reports any it finds. Expressions here can't read env, so
+# the daily cron is written out; tests/test_workflows.py checks it matches.
 concurrency:
   group: sdk-spec-sync-${{ github.event_name == 'schedule' && github.event.schedule != '0 6 * * *' && 'status' || 'sync' }}
   cancel-in-progress: false
@@ -49,11 +54,16 @@ jobs:
   plan:
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    permissions:
+      contents: read
+      # To list this workflow's runs and spot any that a newer run replaced.
+      actions: read
     outputs:
       configured: ${{ steps.secrets.outputs.configured }}
       has_work: ${{ steps.plan.outputs.has_work }}
       mark_processed: ${{ steps.plan.outputs.mark_processed }}
       tags: ${{ steps.plan.outputs.tags }}
+      settled: ${{ steps.plan.outputs.settled }}
       matrix: ${{ steps.plan.outputs.matrix }}
       repos: ${{ steps.plan.outputs.repos }}
     steps:
@@ -100,6 +110,8 @@ jobs:
           REPOS: ${{ inputs.repos }}
           SYNC_DUE: ${{ github.event_name != 'schedule' || github.event.schedule == env.SYNC_CRON }}
         run: |
+          # Without pipefail, a failed ls-remote leaves an empty tag list and a misleading error later.
+          set -o pipefail
           state="$RUNNER_TEMP/state"
           if [ -n "$(git ls-remote "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY.git" refs/heads/spec-sync-state)" ]; then
             git clone --quiet --depth 1 --branch spec-sync-state "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY.git" "$state"
@@ -108,8 +120,32 @@ jobs:
           fi
           tags="$RUNNER_TEMP/api-tags.txt"
           git ls-remote --tags --refs https://github.com/smileidentity/api-reference.git | sed 's#.*refs/tags/##' > "$tags"
+          if [ ! -s "$tags" ]; then
+            echo "::error::Could not list the api-reference tags."
+            exit 1
+          fi
           python3 scripts/spec_sync/spec_sync.py plan --state-dir "$state" --api-tags-file "$tags" \
             --from-tag "$FROM_TAG" --scope "$SCOPE" --repos "$REPOS" --sync-due "$SYNC_DUE"
+
+      # A run cancelled before any job started was most likely replaced while it
+      # waited in the concurrency group. Say so, so a lost manual run is noticed.
+      # This only adds a notice to this run; it never fails the run.
+      - name: Look for replaced runs
+        if: steps.secrets.outputs.configured == 'true' && (github.event_name != 'schedule' || github.event.schedule == env.SYNC_CRON)
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -o pipefail
+          since=$(date -u -d '1 day ago' +%Y-%m-%dT%H:%M:%SZ)
+          gh api -X GET "repos/$GITHUB_REPOSITORY/actions/workflows/sdk-spec-sync.yml/runs" \
+            -f status=cancelled -f "created=>=$since" -F per_page=50 \
+            --jq ".workflow_runs[] | select(.id != $GITHUB_RUN_ID) | [.id, .event, .html_url] | @tsv" > "$RUNNER_TEMP/cancelled.tsv"
+          while IFS=$'\t' read -r id event url; do
+            if [ "$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$id/jobs" --jq .total_count)" = 0 ]; then
+              echo "::notice::A $event run was cancelled before it started, probably because a newer run replaced it while it waited: $url. Run it again if it is still needed."
+            fi
+          done < "$RUNNER_TEMP/cancelled.tsv"
 
   sync:
     needs: plan
@@ -186,6 +222,7 @@ jobs:
           SPEC_TAG: ${{ matrix.spec_tag }}
           FIXTURES_TOKEN: ${{ steps.fixtures-token.outputs.token }}
         run: |
+          set -o pipefail
           mv spec-sync-tools "$TOOLS"
           mkdir -p "$CTX/spec"
           for tag in "$BASE_TAG" "$SPEC_TAG"; do
@@ -224,7 +261,9 @@ jobs:
       - if: matrix.repo == 'smileid-sdk-go'
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          go-version: stable
+          # A new Go minor can break the pinned golangci-lint, so pin the minor too.
+          # Bump this, golangci-lint below and smileid-sdk-go's test.yml lint job together.
+          go-version: '1.27.x'
       - if: matrix.repo == 'smileid-sdk-go'
         uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
         with:
@@ -488,9 +527,12 @@ jobs:
           path: ${{ runner.temp }}/result/job-result.json
           retention-days: 7
 
+  # Marks each pending release as processed for each repository whose job
+  # succeeded, so one failing repository doesn't make the others run again. A
+  # release moves to state/processed once every repository has synced it.
   finish:
     needs: [plan, sync, publish]
-    if: needs.plan.outputs.mark_processed == 'true' && needs.sync.result == 'success' && needs.publish.result == 'success'
+    if: ${{ always() && needs.plan.outputs.mark_processed == 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
@@ -499,15 +541,23 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - if: needs.publish.result != 'skipped'
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: spec-sync-result-*
+          path: ${{ runner.temp }}/results
       - name: Mark the synced lambda releases as processed
         env:
           GH_TOKEN: ${{ github.token }}
-          TAGS: ${{ needs.plan.outputs.tags }}
+          MATRIX: ${{ needs.plan.outputs.matrix }}
+          SETTLED: ${{ needs.plan.outputs.settled }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           tools="$GITHUB_WORKSPACE/scripts/spec_sync"
-          bash "$tools/commit-state.sh" "Mark $(jq -r 'join(", ")' <<<"$TAGS") as processed" -- \
-            python3 "$tools/spec_sync.py" mark-processed --state-dir . --tags "$TAGS" --run-url "$RUN_URL"
+          mkdir -p "$RUNNER_TEMP/results"
+          bash "$tools/commit-state.sh" "Mark the lambda releases synced by $RUN_URL" -- \
+            python3 "$tools/spec_sync.py" mark-processed --state-dir . --matrix "$MATRIX" --settled "$SETTLED" \
+            --results-dir "$RUNNER_TEMP/results" --run-url "$RUN_URL"
 
   status:
     needs: [plan, sync, publish, finish]
@@ -557,3 +607,31 @@ jobs:
           python3 scripts/spec_sync/spec_sync.py status --state-dir "$state" --results-dir "$RUNNER_TEMP/results" \
             --planned-repos "$REPOS" --sync-result "$SYNC_RESULT" --run-url "$RUN_URL" \
             --body-file "$RUNNER_TEMP/status-issue.md"
+
+  # GitHub turns off a public repository's scheduled workflows after 60 days with
+  # no repository activity. Enabling a workflow through the API restarts that
+  # count, so each scheduled run does it for the scheduled workflows here. It
+  # leaves alone a workflow a person turned off, and it never comments, opens
+  # issues or sends anything: it only writes to this run's log.
+  keepalive:
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      actions: write
+    steps:
+      - name: Keep the scheduled workflows enabled
+        env:
+          GH_TOKEN: ${{ github.token }}
+          WORKFLOWS: sdk-spec-sync.yml sdk-fixtures-personas.yml pr-hygiene.yml
+        run: |
+          for workflow in $WORKFLOWS; do
+            state=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/$workflow" --jq .state)
+            case "$state" in
+              active|disabled_inactivity)
+                gh api -X PUT "repos/$GITHUB_REPOSITORY/actions/workflows/$workflow/enable" --silent
+                echo "$workflow was $state; enabled it." ;;
+              *)
+                echo "::notice::$workflow is $state, so it was left alone." ;;
+            esac
+          done
