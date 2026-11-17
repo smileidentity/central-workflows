@@ -518,7 +518,7 @@ class PrepareAndPublishTest(unittest.TestCase):
         self.assertNotIn("{{", task)
         for text in ("smileidentity/smileid-sdk-go", f"{self.ctx}/spec/v3.12.0/openapi.yaml",
                      "rolling spec-sync pull request", "There is no open pull request yet.", f"{self.ctx}/fixtures",
-                     "`x-smile-token-product`"):
+                     "`x-smile-token-product`", "Do not fetch, pull or clone", "copy the checkout to a temporary directory outside it with `cp -a`"):
             self.assertIn(text, task)
         self.assertIn("Added phone.", (self.ctx / "summaries.md").read_text())
         lambda_text = (self.ctx / "lambda-prs.md").read_text()

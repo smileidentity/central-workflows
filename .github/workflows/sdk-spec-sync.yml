@@ -336,6 +336,30 @@ jobs:
             --allowedTools Bash,Read,Write,Edit,MultiEdit,Glob,Grep,TodoWrite
             --model ${{ vars.SDK_SPEC_SYNC_MODEL }}
 
+      # claude-code-action points `origin` at this repository, so a fetch by
+      # Claude replaces origin/<default> with unrelated history. Like the bundle
+      # step, this runs git in the tree Claude worked in, so it drops the AWS and
+      # OIDC credentials first and runs no hooks or fsmonitor.
+      - name: Record the checkout's history after Claude runs
+        if: ${{ !cancelled() && steps.prepare.outcome == 'success' }}
+        env:
+          DEFAULT_SHA: ${{ steps.prepare.outputs.default_sha }}
+        run: |
+          unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN ACTIONS_ID_TOKEN_REQUEST_TOKEN ACTIONS_ID_TOKEN_REQUEST_URL
+          git() { command git -c core.hooksPath=/dev/null -c core.fsmonitor=false "$@"; }
+          echo "shallow: $(git rev-parse --is-shallow-repository)"
+          echo "tags: $(git tag -l | wc -l)"
+          if git merge-base HEAD "$DEFAULT_SHA" > /dev/null 2>&1; then
+            echo "merge base with the default branch: found"
+          else
+            echo "merge base with the default branch: missing"
+          fi
+          if git for-each-ref --format='%(objectname)' refs/remotes/origin | grep -qx "$DEFAULT_SHA"; then
+            echo "origin still has the default branch's head"
+          else
+            echo "::warning::origin no longer has the default branch's head. Claude probably fetched from origin."
+          fi
+
       # No token or AWS credential is in this step's environment, and git runs
       # no hooks or fsmonitor from the tree Claude worked in.
       - name: Bundle the change for the publish job
