@@ -105,6 +105,10 @@ class StateTest(unittest.TestCase):
         # A repeat dispatch keeps the repositories that already synced the release.
         s.record_dispatch({"client_payload": record("v3.11.0", "v3.10.0")}, self.dir, "later", NOW)
         self.assertEqual(s.processed_repos(s.find_record(self.dir, "v3.11.0")), {"smileid-sdk-go"})
+        # A repeat dispatch with a different change starts again for every repository.
+        changed = record("v3.11.0", "v3.10.0", summary="Removed a field.")
+        s.record_dispatch({"client_payload": changed}, self.dir, "later", NOW)
+        self.assertEqual(s.processed_repos(s.find_record(self.dir, "v3.11.0")), set())
 
         # The record moves once the last repository has synced it; the first run's time is kept.
         rest = {repo: ["v3.10.0"] for repo in s.ALL_REPOS if repo != "smileid-sdk-go"}

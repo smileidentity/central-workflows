@@ -177,10 +177,14 @@ def record_dispatch(event, state_dir, run_url, now):
     record["received_at"] = now
     record["run_url"] = run_url
     path = state / "pending" / f"{record['tag']}.json"
-    # A repeat dispatch for the same tag keeps the repositories that already synced it.
+    # A repeat dispatch for the same tag keeps the repositories that already synced
+    # it, unless what they synced has changed.
     previous = read_json(path, {})
-    if isinstance(previous, dict) and previous.get("processed_repos"):
-        record["processed_repos"] = previous["processed_repos"]
+    if isinstance(previous, dict) and isinstance(previous.get("processed_repos"), dict) and previous["processed_repos"]:
+        if all(previous.get(k) == record[k] for k in ("previous_tag", "breaking", "summary", "lambda_prs")):
+            record["processed_repos"] = previous["processed_repos"]
+        else:
+            print(f"::notice::{record['tag']} changed since it was first recorded, so every repository syncs it again")
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(record, indent=2, sort_keys=True) + "\n")
     print(f"Recorded {record['tag']} (compared with {record['previous_tag']}, breaking: {record['breaking']})")
