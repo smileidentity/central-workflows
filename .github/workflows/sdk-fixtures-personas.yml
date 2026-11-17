@@ -293,14 +293,18 @@ jobs:
           rm -f cases/*.json
           cp "$extract/personas.json" personas.json
           if [ -d "$extract/cases" ]; then
+            mkdir -p cases
             find "$extract/cases" -maxdepth 1 -type f -name '*.json' -exec cp {} cases/ \;
           fi
+          # With no case files, cases/*.json would stay as written and jq would fail on it.
+          shopt -s nullglob
           for f in personas.json cases/*.json; do
             if ! jq empty "$f" > /dev/null 2>&1; then
               echo "::error::The bundle holds a file that isn't valid JSON, so nothing was published."
               exit 1
             fi
           done
+          shopt -u nullglob
           # The recorded lambda commit changes with every release; only the rest matters.
           # git status, unlike git diff, also lists case files the rebuild added.
           if jq -e --slurpfile before "$RUNNER_TEMP/personas-before.json" \

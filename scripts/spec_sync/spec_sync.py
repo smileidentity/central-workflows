@@ -3,11 +3,12 @@
 
 Subcommands:
   record          store a sdk-spec-changed dispatch as state/pending/<tag>.json
-  plan            work out which SDK jobs to run from the pending records
+  plan            work out which SDK jobs to run from the records still pending for each repository
   prepare         set up an SDK checkout and the context files for Claude
   package         bundle Claude's change for the publish job
   publish         check the sync job's patch, push it and create or update the PR
-  mark-processed  move records from state/pending to state/processed
+  mark-processed  record which repositories have synced each release; move a record
+                to state/processed once every repository has
   status          mark green spec-sync PRs ready and rewrite the status issue
 
 Each subcommand is a thin wrapper around functions that tests call directly.
@@ -176,6 +177,14 @@ def record_dispatch(event, state_dir, run_url, now):
     record["received_at"] = now
     record["run_url"] = run_url
     path = state / "pending" / f"{record['tag']}.json"
+    # A repeat dispatch for the same tag keeps the repositories that already synced
+    # it, unless what they synced has changed.
+    previous = read_json(path, {})
+    if isinstance(previous, dict) and isinstance(previous.get("processed_repos"), dict) and previous["processed_repos"]:
+        if all(previous.get(k) == record[k] for k in ("previous_tag", "breaking", "summary", "lambda_prs")):
+            record["processed_repos"] = previous["processed_repos"]
+        else:
+            print(f"::notice::{record['tag']} changed since it was first recorded, so every repository syncs it again")
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(record, indent=2, sort_keys=True) + "\n")
     print(f"Recorded {record['tag']} (compared with {record['previous_tag']}, breaking: {record['breaking']})")
@@ -201,23 +210,78 @@ def find_record(state_dir, tag):
     return None
 
 
-def mark_processed(state_dir, tags, now, run_url):
+def processed_repos(record):
+    """The repositories that have already synced a pending record.
+
+    Records written before this was tracked have no processed_repos, so every
+    repository still needs them.
+    """
+    done = record.get("processed_repos")
+    return set(done) if isinstance(done, dict) else set()
+
+
+def mark_processed(state_dir, done, now, run_url):
+    """Record that repositories have synced releases.
+
+    done maps each repository to the tags it synced. A list of tags means every
+    repository. A record moves to state/processed once every repository has
+    synced it. Returns the tags moved.
+    """
+    if isinstance(done, list):
+        done = {repo: done for repo in ALL_REPOS}
+    by_tag = {}
+    for repo, tags in done.items():
+        if repo not in ALL_REPOS:
+            raise SpecSyncError(f"Unknown repository '{repo}'")
+        for tag in tags:
+            tag_key(tag)
+            by_tag.setdefault(tag, set()).add(repo)
     state = Path(state_dir) / "state"
     moved = []
-    for tag in tags:
-        tag_key(tag)
+    for tag in sorted(by_tag, key=tag_key):
         source = state / "pending" / f"{tag}.json"
         if not source.exists():
             continue
         record = json.loads(source.read_text())
-        record["processed_at"] = now
-        record["processed_by"] = run_url
-        target = state / "processed" / f"{tag}.json"
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(json.dumps(record, indent=2, sort_keys=True) + "\n")
-        source.unlink()
-        moved.append(tag)
+        repos = record.get("processed_repos") if isinstance(record.get("processed_repos"), dict) else {}
+        for repo in sorted(by_tag[tag] - set(repos)):
+            repos[repo] = {"at": now, "by": run_url}
+        record["processed_repos"] = dict(sorted(repos.items()))
+        if set(repos) >= set(ALL_REPOS):
+            record["processed_at"] = now
+            record["processed_by"] = run_url
+            target = state / "processed" / f"{tag}.json"
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(json.dumps(record, indent=2, sort_keys=True) + "\n")
+            source.unlink()
+            moved.append(tag)
+        else:
+            source.write_text(json.dumps(record, indent=2, sort_keys=True) + "\n")
     return moved
+
+
+# A job counts as done when it published a change, found none needed, or opened
+# a draft PR listing what Claude could not finish for a person to pick up.
+DONE_STATUSES = ("updated", "no_change", "blocked")
+
+
+def synced_by_run(matrix, settled, job_results):
+    """Work out which tags each repository synced in this run.
+
+    The tags come from the plan's matrix, not from the job results, so a result
+    can only confirm a job the plan asked for. A job counts only if every result
+    for it is done.
+    """
+    statuses = {}
+    for result in job_results:
+        if isinstance(result, dict):
+            statuses.setdefault((result.get("repo"), result.get("branch")), []).append(result.get("status"))
+    done = {repo: list(tags) for repo, tags in (settled or {}).items()}
+    for entry in matrix.get("include", []):
+        found = statuses.get((entry["repo"], entry["branch"]))
+        if found and all(status in DONE_STATUSES for status in found):
+            done.setdefault(entry["repo"], []).extend(entry["tags"])
+    return {repo: merge_tags(tags) for repo, tags in done.items() if tags}
 
 
 def latest_tag(tags):
@@ -277,15 +341,63 @@ def api_tag_for(tag, api_tags):
     return max(candidates, key=tag_key)
 
 
+def plan_units(pending, *, from_tag, latest_api_tag):
+    """The pull requests to make from the pending records, and the tags they need no job for."""
+    if from_tag:
+        # The SDKs already match from_tag, so older pending records are done too.
+        already = [r["tag"] for r in pending if tag_key(r["tag"]) <= tag_key(from_tag)]
+        pending = [r for r in pending if tag_key(r["tag"]) > tag_key(from_tag)]
+    else:
+        already = []
+    units = []
+    normal = [r for r in pending if not r["breaking"]]
+    breaking = [r for r in pending if r["breaking"]]
+    if from_tag and (normal or tag_key(latest_api_tag) > tag_key(from_tag)):
+        units.append(unit("rolling", ROLLING_BRANCH, from_tag, latest_api_tag, normal))
+    elif normal:
+        units.append(unit("rolling", ROLLING_BRANCH, normal[0]["previous_tag"], normal[-1]["tag"], normal))
+    for record in breaking:
+        units.append(
+            unit("breaking", f"spec-sync/breaking-{record['tag']}", record["previous_tag"], record["tag"], [record])
+        )
+    return units, already
+
+
+def map_units(units, api_tags):
+    """Map lambda tags to api-reference tags. Returns the units to run and the tags of those dropped.
+
+    A unit whose old and new tags map to the same api-reference tag changes
+    nothing in the public spec, so it needs no job and its records are done.
+    """
+    if api_tags is None:
+        return units, []
+    kept, dropped = [], []
+    for u in units:
+        u["base_tag"] = api_tag_for(u["base_tag"], api_tags)
+        u["spec_tag"] = api_tag_for(u["spec_tag"], api_tags)
+        if u["base_tag"] != u["spec_tag"] or u["kind"] == "scoped":
+            kept.append(u)
+        else:
+            dropped += u["tags"]
+    return kept, dropped
+
+
 def plan(pending, *, from_tag="", scope="", repos="", latest_api_tag=None, sync_due=True, api_tags=None):
     """Return the matrix of jobs to run and the records they consume.
 
+    Each repository gets jobs only for the records it has not yet synced.
     Non-breaking records share the rolling PR. Each breaking record gets its own
     PR. A manual run with from_tag syncs everything from that tag to the newest
     api-reference tag. A manual run with scope makes one PR limited to that scope
     and leaves the pending records alone.
+
+    settled maps each repository to the tags it needs no job for: records at or
+    before from_tag, and records that change nothing in the public spec. The
+    finish job marks those, and the tags of each job that succeeds, as processed
+    for that repository.
     """
-    result = {"has_work": False, "mark_processed": False, "tags": [], "units": [], "matrix": {"include": []}}
+    result = {"has_work": False, "mark_processed": False, "tags": [], "units": [], "settled": {},
+              "matrix": {"include": []}}
     if not sync_due:
         result["reason"] = "Hourly run: only marking green PRs ready and updating the status issue."
         return result
@@ -298,50 +410,39 @@ def plan(pending, *, from_tag="", scope="", repos="", latest_api_tag=None, sync_
             raise SpecSyncError("Could not find the latest api-reference tag")
         if tag_key(latest_api_tag) < tag_key(from_tag):
             raise SpecSyncError(f"from_tag {from_tag} is newer than the latest api-reference tag {latest_api_tag}")
-        # The SDKs already match from_tag, so older pending records are done too.
-        already = [r["tag"] for r in pending if tag_key(r["tag"]) <= tag_key(from_tag)]
-        pending = [r for r in pending if tag_key(r["tag"]) > tag_key(from_tag)]
-    else:
-        already = []
 
-    units = []
+    include, units, settled = [], [], {}
     if scope:
-        units.append(unit("scoped", f"spec-sync/{slug(scope)}", from_tag, latest_api_tag, [], scope))
-        consumed = []
+        (scoped,) = map_units([unit("scoped", f"spec-sync/{slug(scope)}", from_tag, latest_api_tag, [], scope)],
+                              api_tags)[0]
+        units.append(scoped)
+        include = [{"repo": repo, **scoped} for repo in targets]
     else:
-        normal = [r for r in pending if not r["breaking"]]
-        breaking = [r for r in pending if r["breaking"]]
-        if from_tag and (normal or tag_key(latest_api_tag) > tag_key(from_tag)):
-            units.append(unit("rolling", ROLLING_BRANCH, from_tag, latest_api_tag, normal))
-        elif normal:
-            units.append(unit("rolling", ROLLING_BRANCH, normal[0]["previous_tag"], normal[-1]["tag"], normal))
-        for record in breaking:
-            units.append(
-                unit("breaking", f"spec-sync/breaking-{record['tag']}", record["previous_tag"], record["tag"], [record])
-            )
-        consumed = already + [r["tag"] for r in pending]
+        for repo in targets:
+            repo_pending = [r for r in pending if repo not in processed_repos(r)]
+            repo_units, already = plan_units(repo_pending, from_tag=from_tag, latest_api_tag=latest_api_tag)
+            repo_units, unchanged = map_units(repo_units, api_tags)
+            if already or unchanged:
+                settled[repo] = merge_tags(already, unchanged)
+            for u in repo_units:
+                include.append({"repo": repo, **u})
+                if u not in units:
+                    units.append(u)
 
-    # Records carry lambda tags; the specs are read from api-reference tags.
-    if api_tags is not None:
-        mapped = []
-        for u in units:
-            u["base_tag"] = api_tag_for(u["base_tag"], api_tags)
-            u["spec_tag"] = api_tag_for(u["spec_tag"], api_tags)
-            if u["base_tag"] != u["spec_tag"] or u["kind"] == "scoped":
-                mapped.append(u)
-        units = mapped
-
-    include = [{"repo": repo, **u} for u in units for repo in targets]
+    consumed = merge_tags(*settled.values(), *(i["tags"] for i in include))
     result.update(
         has_work=bool(include),
         units=units,
         tags=consumed,
-        # A run limited to some repositories has not synced the others.
-        mark_processed=bool(consumed) and targets == ALL_REPOS,
+        settled=settled,
+        mark_processed=bool(consumed),
         matrix={"include": include},
     )
     if not include:
-        result["reason"] = "Nothing is pending."
+        result["reason"] = (
+            f"No job is needed: {', '.join(consumed)} change nothing in the public spec." if consumed
+            else "Nothing is pending."
+        )
     return result
 
 
@@ -863,14 +964,21 @@ def update_last_runs(previous, job_results, planned_repos, run_url, now, sync_re
     return runs
 
 
-def render_status_issue(*, prs, runs, pending, last_processed, run_url, now):
+def render_status_issue(*, prs, runs, pending, last_processed, run_url, now, synced=None):
+    """synced maps a pending tag to the number of repositories that have already synced it."""
     state = {"runs": runs}
+    synced = synced or {}
+
+    def pending_text(tag):
+        count = synced.get(tag)
+        return f"`{tag}` ({count} of {len(ALL_REPOS)} repositories done)" if count else f"`{tag}`"
+
     lines = [
         write_marker(ISSUE_MARKER, state),
         "The `sdk-spec-sync` workflow keeps this issue up to date. It edits this description in place and does not comment.",
         "",
         (
-            f"Pending lambda releases: {', '.join(f'`{t}`' for t in pending) or 'none'}. "
+            f"Pending lambda releases: {', '.join(pending_text(t) for t in pending) or 'none'}. "
             f"Last processed: {f'`{last_processed}`' if last_processed else 'none'}."
         ),
         "",
@@ -981,7 +1089,10 @@ def main(argv=None):
 
     p = sub.add_parser("mark-processed")
     p.add_argument("--state-dir", default=".")
-    p.add_argument("--tags", required=True, help="JSON list of tags")
+    p.add_argument("--tags", help="JSON list of tags that every repository has synced")
+    p.add_argument("--matrix", help="the plan's matrix as JSON; with --results-dir, marks the jobs that succeeded")
+    p.add_argument("--settled", default="{}", help="the plan's settled tags as JSON")
+    p.add_argument("--results-dir", help="the publish jobs' job-result.json files")
     p.add_argument("--run-url", required=True)
 
     p = sub.add_parser("status")
@@ -1006,6 +1117,7 @@ def main(argv=None):
             for key in ("has_work", "mark_processed"):
                 write_output(key, str(result[key]).lower())
             write_output("tags", result["tags"])
+            write_output("settled", result["settled"])
             write_output("matrix", result["matrix"])
             write_output("repos", sorted({i["repo"] for i in result["matrix"]["include"]}))
             print(result.get("reason") or f"Planned {len(result['matrix']['include'])} jobs for "
@@ -1027,8 +1139,18 @@ def main(argv=None):
                     state_dir=args.state_dir, write_token=os.environ["WRITE_TOKEN"], bot_name=args.bot_name,
                     bot_email=args.bot_email, run_url=args.run_url, now=now_utc())
         elif args.command == "mark-processed":
-            moved = mark_processed(args.state_dir, json.loads(args.tags), now_utc(), args.run_url)
-            print(f"Marked as processed: {', '.join(moved) or 'nothing'}")
+            if args.tags:
+                done = json.loads(args.tags)
+            else:
+                results = []
+                if args.results_dir:
+                    results = [read_json(p, {}) for p in sorted(Path(args.results_dir).glob("**/job-result.json"))]
+                done = synced_by_run(json.loads(args.matrix or '{"include": []}'), json.loads(args.settled), results)
+                for repo in ALL_REPOS:
+                    if repo in done:
+                        print(f"{repo} synced {', '.join(done[repo])}")
+            moved = mark_processed(args.state_dir, done, now_utc(), args.run_url)
+            print(f"Processed by every repository: {', '.join(moved) or 'nothing new'}")
         elif args.command == "status":
             token = os.environ["APP_TOKEN"]
             issue_token = os.environ["ISSUE_TOKEN"]
@@ -1041,10 +1163,11 @@ def main(argv=None):
             runs = update_last_runs(previous, [r for r in results if r.get("repo")],
                                     json.loads(args.planned_repos), args.run_url, now, args.sync_result)
             processed = load_records(args.state_dir, "processed")
-            body = render_status_issue(prs=prs, runs=runs,
-                                       pending=[r["tag"] for r in load_records(args.state_dir, "pending")],
+            pending = load_records(args.state_dir, "pending")
+            body = render_status_issue(prs=prs, runs=runs, pending=[r["tag"] for r in pending],
                                        last_processed=processed[-1]["tag"] if processed else "",
-                                       run_url=args.run_url, now=now)
+                                       run_url=args.run_url, now=now,
+                                       synced={r["tag"]: len(processed_repos(r) & set(ALL_REPOS)) for r in pending})
             number = write_status_issue(repo_full, issue_token, body, issue, args.body_file)
             print(f"Updated status issue #{number}")
     except SpecSyncError as error:
