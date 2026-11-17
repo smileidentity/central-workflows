@@ -4,6 +4,8 @@
     5258
   ],
   "previous_tag": "v3.1187.0",
+  "processed_at": "2026-11-17 17:01 UTC",
+  "processed_by": "https://github.com/smileidentity/central-workflows/actions/runs/44131475462",
   "received_at": "2026-11-17 15:34 UTC",
   "run_url": "https://github.com/smileidentity/central-workflows/actions/runs/44115909522",
   "summary": "# API Changelog 3.0.0 vs. 3.0.0\n\n\n## API Changes\n\n### POST /v3/token\n-  added the new `residency_document_verification` enum value to the request property `product`\n\n\n\n\n\n\n",
