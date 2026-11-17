@@ -91,6 +91,82 @@ class StateTest(unittest.TestCase):
         self.assertIsNone(s.record_dispatch(event, self.dir, RUN, NOW))
         self.assertEqual(s.load_records(self.dir, "pending"), [])
 
+    def test_processed_per_repository(self):
+        write_state(self.dir, "pending", record("v3.10.0", "v3.9.0"), record("v3.11.0", "v3.10.0"))
+        # Records written before per-repository tracking need every repository.
+        self.assertEqual(s.processed_repos(s.find_record(self.dir, "v3.10.0")), set())
+
+        go_and_java = {"smileid-sdk-go": ["v3.10.0", "v3.11.0"], "smileid-sdk-java": ["v3.10.0"]}
+        self.assertEqual(s.mark_processed(self.dir, go_and_java, NOW, RUN), [])
+        self.assertEqual(s.processed_repos(s.find_record(self.dir, "v3.10.0")), {"smileid-sdk-go", "smileid-sdk-java"})
+        self.assertEqual(s.find_record(self.dir, "v3.11.0")["processed_repos"],
+                         {"smileid-sdk-go": {"at": NOW, "by": RUN}})
+
+        # A repeat dispatch keeps the repositories that already synced the release.
+        s.record_dispatch({"client_payload": record("v3.11.0", "v3.10.0")}, self.dir, "later", NOW)
+        self.assertEqual(s.processed_repos(s.find_record(self.dir, "v3.11.0")), {"smileid-sdk-go"})
+        # A repeat dispatch with a different change starts again for every repository.
+        changed = record("v3.11.0", "v3.10.0", summary="Removed a field.")
+        s.record_dispatch({"client_payload": changed}, self.dir, "later", NOW)
+        self.assertEqual(s.processed_repos(s.find_record(self.dir, "v3.11.0")), set())
+
+        # The record moves once the last repository has synced it; the first run's time is kept.
+        rest = {repo: ["v3.10.0"] for repo in s.ALL_REPOS if repo != "smileid-sdk-go"}
+        self.assertEqual(s.mark_processed(self.dir, rest, "later", "run-2"), ["v3.10.0"])
+        processed = s.load_records(self.dir, "processed")[0]
+        self.assertEqual((processed["processed_by"], processed["processed_repos"]["smileid-sdk-java"]["by"]),
+                         ("run-2", RUN))
+        self.assertEqual([r["tag"] for r in s.load_records(self.dir, "pending")], ["v3.11.0"])
+        with self.assertRaises(s.SpecSyncError):
+            s.mark_processed(self.dir, {"smileid-sdk-cobol": ["v3.11.0"]}, NOW, RUN)
+
+    def test_synced_by_run(self):
+        matrix = {"include": [
+            {"repo": "smileid-sdk-go", "branch": "spec-sync/rolling", "tags": ["v3.12.0", "v3.10.0"]},
+            {"repo": "smileid-sdk-go", "branch": "spec-sync/breaking-v3.11.0", "tags": ["v3.11.0"]},
+            {"repo": "smileid-sdk-java", "branch": "spec-sync/rolling", "tags": ["v3.10.0", "v3.12.0"]},
+            {"repo": "smileid-sdk-php", "branch": "spec-sync/rolling", "tags": ["v3.10.0", "v3.12.0"]},
+            {"repo": "smileid-sdk-ruby", "branch": "spec-sync/rolling", "tags": ["v3.10.0", "v3.12.0"]},
+            {"repo": "smileid-sdk-rust", "branch": "spec-sync/rolling", "tags": ["v3.10.0", "v3.12.0"]},
+        ]}
+        results = [
+            {"repo": "smileid-sdk-go", "branch": "spec-sync/rolling", "status": "updated", "tags": ["v9.9.9"]},
+            {"repo": "smileid-sdk-go", "branch": "spec-sync/breaking-v3.11.0", "status": "failed"},
+            {"repo": "smileid-sdk-java", "branch": "spec-sync/rolling", "status": "no_change"},
+            {"repo": "smileid-sdk-php", "branch": "spec-sync/rolling", "status": "blocked"},
+            # Two results for one job: both must be done.
+            {"repo": "smileid-sdk-ruby", "branch": "spec-sync/rolling", "status": "updated"},
+            {"repo": "smileid-sdk-ruby", "branch": "spec-sync/rolling", "status": "failed"},
+            # A result for a job the plan didn't ask for counts for nothing.
+            {"repo": "smileid-sdk-js", "branch": "spec-sync/rolling", "status": "updated"},
+            "junk",
+        ]
+        done = s.synced_by_run(matrix, {"smileid-sdk-go": ["v3.9.0"], "smileid-sdk-js": []}, results)
+        self.assertEqual(done, {
+            "smileid-sdk-go": ["v3.9.0", "v3.10.0", "v3.12.0"],
+            "smileid-sdk-java": ["v3.10.0", "v3.12.0"],
+            "smileid-sdk-php": ["v3.10.0", "v3.12.0"],
+        })
+
+    def test_mark_processed_command(self):
+        write_state(self.dir, "pending", record("v3.10.0", "v3.9.0"), record("v3.11.0", "v3.10.0"))
+        results = Path(self.dir) / "results" / "spec-sync-result-0"
+        results.mkdir(parents=True)
+        (results / "job-result.json").write_text(json.dumps(
+            {"repo": "smileid-sdk-go", "branch": "spec-sync/rolling", "status": "updated"}))
+        matrix = {"include": [{"repo": "smileid-sdk-go", "branch": "spec-sync/rolling", "tags": ["v3.11.0"]},
+                              {"repo": "smileid-sdk-java", "branch": "spec-sync/rolling", "tags": ["v3.11.0"]}]}
+        settled = {repo: ["v3.10.0"] for repo in s.ALL_REPOS}
+        self.assertEqual(s.main(["mark-processed", "--state-dir", self.dir, "--matrix", json.dumps(matrix),
+                                 "--settled", json.dumps(settled), "--results-dir", str(results.parent),
+                                 "--run-url", RUN]), 0)
+        self.assertEqual([r["tag"] for r in s.load_records(self.dir, "processed")], ["v3.10.0"])
+        self.assertEqual(s.processed_repos(s.find_record(self.dir, "v3.11.0")), {"smileid-sdk-go"})
+        # With no job results, a plan that ran no job still marks its settled tags.
+        self.assertEqual(s.main(["mark-processed", "--state-dir", self.dir, "--matrix", '{"include": []}',
+                                 "--settled", json.dumps({"smileid-sdk-java": ["v3.11.0"]}), "--run-url", RUN]), 0)
+        self.assertEqual(s.processed_repos(s.find_record(self.dir, "v3.11.0")), {"smileid-sdk-go", "smileid-sdk-java"})
+
     def test_records_load_in_version_order(self):
         write_state(self.dir, "pending", record("v3.100.0", "v3.99.0"), record("v3.99.0", "v3.98.0"))
         self.assertEqual([r["tag"] for r in s.load_records(self.dir, "pending")], ["v3.99.0", "v3.100.0"])
@@ -139,13 +215,36 @@ class PlanTest(unittest.TestCase):
         self.assertFalse(p["has_work"])
         self.assertEqual(p["matrix"], {"include": []})
 
-    def test_some_repos_leave_records_pending(self):
+    def test_some_repos_mark_only_their_own_progress(self):
         p = s.plan(self.pending, repos="go, smileid-sdk-fixtures,go")
         self.assertEqual(sorted({i["repo"] for i in p["matrix"]["include"]}),
                          ["smileid-sdk-fixtures", "smileid-sdk-go"])
-        self.assertFalse(p["mark_processed"])
+        # The finish job marks only the jobs that ran, so a targeted run can clear its own repositories.
+        self.assertTrue(p["mark_processed"])
         with self.assertRaises(s.SpecSyncError):
             s.plan(self.pending, repos="cobol")
+
+    def test_each_repository_runs_only_what_it_has_not_synced(self):
+        done = {"at": NOW, "by": RUN}
+        pending = [
+            {**record("v3.10.0", "v3.9.0", prs=[1]), "processed_repos": {"smileid-sdk-go": done}},
+            {**record("v3.11.0", "v3.10.0", breaking=True, prs=[2]),
+             "processed_repos": {"smileid-sdk-go": done, "smileid-sdk-java": done}},
+            record("v3.12.0", "v3.11.0", prs=[3]),
+        ]
+        p = s.plan(pending, latest_api_tag="v3.12.0")
+        by_repo = {}
+        for entry in p["matrix"]["include"]:
+            by_repo.setdefault(entry["repo"], []).append((entry["branch"], entry["base_tag"], entry["tags"]))
+        self.assertEqual(by_repo["smileid-sdk-go"], [("spec-sync/rolling", "v3.11.0", ["v3.12.0"])])
+        self.assertEqual(by_repo["smileid-sdk-java"], [("spec-sync/rolling", "v3.9.0", ["v3.10.0", "v3.12.0"])])
+        self.assertEqual(by_repo["smileid-sdk-rust"], [("spec-sync/rolling", "v3.9.0", ["v3.10.0", "v3.12.0"]),
+                                                       ("spec-sync/breaking-v3.11.0", "v3.10.0", ["v3.11.0"])])
+        # A repository that has synced everything gets no job.
+        everyone = {repo: done for repo in s.ALL_REPOS}
+        p = s.plan([{**record("v3.12.0", "v3.11.0"), "processed_repos": {**everyone}}], latest_api_tag="v3.12.0")
+        self.assertFalse(p["has_work"])
+        self.assertFalse(p["mark_processed"])
 
     def test_from_tag_backlog(self):
         p = s.plan(self.pending, from_tag="v3.10.0", latest_api_tag="v3.15.0")
@@ -190,6 +289,7 @@ class PlanTest(unittest.TestCase):
         text = out.read_text()
         self.assertIn("has_work<<SPEC_SYNC_EOF\ntrue\n", text)
         self.assertIn('tags<<SPEC_SYNC_EOF\n["v3.10.0","v3.11.0","v3.12.0"]\n', text)
+        self.assertIn("settled<<SPEC_SYNC_EOF\n{}\n", text)
         matrix = json.loads(text.split("matrix<<SPEC_SYNC_EOF\n")[1].split("\n")[0])
         self.assertEqual(len(matrix["include"]), 16)
 
@@ -207,6 +307,14 @@ class PlanTest(unittest.TestCase):
         p = s.plan([record("v3.12.0", "v3.11.0")], latest_api_tag="v3.10.0", api_tags=["v3.10.0"])
         self.assertFalse(p["has_work"])
         self.assertEqual(p["tags"], ["v3.12.0"])
+        # No job runs, but the record is still marked processed for every repository.
+        self.assertTrue(p["mark_processed"])
+        self.assertEqual(p["settled"], {repo: ["v3.12.0"] for repo in s.ALL_REPOS})
+        self.assertIn("change nothing in the public spec", p["reason"])
+
+    def test_from_tag_settles_older_records_for_the_chosen_repos(self):
+        p = s.plan(self.pending, from_tag="v3.10.0", latest_api_tag="v3.15.0", repos="go")
+        self.assertEqual(p["settled"], {"smileid-sdk-go": ["v3.10.0"]})
 
     def test_tag_older_than_every_api_reference_tag(self):
         with self.assertRaises(s.SpecSyncError):
@@ -409,6 +517,9 @@ class StatusTest(unittest.TestCase):
                       f"updated, [{NOW}]({RUN}) |", body)
         self.assertIn("| `smileid-sdk-php` | none | `v3.12.0` | not run yet |", body)
         self.assertIn("Pending lambda releases: `v3.13.0`.", body)
+        partial = s.render_status_issue(prs={}, runs={}, pending=["v3.13.0", "v3.14.0"], last_processed="",
+                                        run_url=RUN, now=NOW, synced={"v3.13.0": 3, "v3.14.0": 0})
+        self.assertIn("Pending lambda releases: `v3.13.0` (3 of 8 repositories done), `v3.14.0`.", partial)
         empty = s.render_status_issue(prs={}, runs={}, pending=[], last_processed="", run_url=RUN, now=NOW)
         self.assertIn("| `smileid-sdk-go` | none | unknown | not run yet |", empty)
 
