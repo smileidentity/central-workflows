@@ -800,6 +800,10 @@ def checks_state(rollup):
     if not rollup:
         return "none"
     state = "success"
+    # A newer run of a workflow can cancel an older one on the same commit, for
+    # example when a label is added just after a push. The rollup keeps both, so
+    # judge each check by its latest run, unless a run of it is still going.
+    latest, running = {}, set()
     for item in rollup:
         if item.get("__typename") == "StatusContext" or "state" in item and "status" not in item:
             value = (item.get("state") or "").upper()
@@ -807,11 +811,16 @@ def checks_state(rollup):
                 state = "pending"
             elif value != "SUCCESS":
                 return "failure"
-        else:
-            if (item.get("status") or "").upper() != "COMPLETED":
-                state = "pending"
-            elif (item.get("conclusion") or "").upper() not in ("SUCCESS", "NEUTRAL", "SKIPPED"):
-                return "failure"
+            continue
+        key = (item.get("workflowName") or "", item.get("name") or "")
+        if (item.get("status") or "").upper() != "COMPLETED":
+            state = "pending"
+            running.add(key)
+        elif key not in latest or (item.get("startedAt") or "") > (latest[key].get("startedAt") or ""):
+            latest[key] = item
+    for key, item in latest.items():
+        if key not in running and (item.get("conclusion") or "").upper() not in ("SUCCESS", "NEUTRAL", "SKIPPED"):
+            return "failure"
     return state
 
 
@@ -832,9 +841,14 @@ def promote_prs(repos, token):
             checks = checks_state(pr.get("statusCheckRollup"))
             draft = pr.get("isDraft", False)
             if draft and checks == "success" and marker.get("ready_ok"):
-                gh(["pr", "ready", str(pr["number"]), "--repo", f"{ORG}/{repo}"], token)
-                print(f"Marked {pr['url']} ready for review")
-                draft = False
+                # One PR that can't be marked ready must not stop the others or the status issue.
+                try:
+                    gh(["pr", "ready", str(pr["number"]), "--repo", f"{ORG}/{repo}"], token)
+                except SpecSyncError as e:
+                    print(f"::warning::Could not mark {pr['url']} ready for review: {e}")
+                else:
+                    print(f"Marked {pr['url']} ready for review")
+                    draft = False
             prs.append({"number": pr["number"], "url": pr["url"], "draft": draft, "checks": checks,
                         "branch": pr.get("headRefName", ""), "spec_tag": marker.get("spec_tag", "")})
         found[repo] = sorted(prs, key=lambda p: p["number"])
