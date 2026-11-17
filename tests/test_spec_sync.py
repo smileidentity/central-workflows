@@ -355,6 +355,25 @@ class StatusTest(unittest.TestCase):
         self.assertEqual([(p["number"], p["draft"]) for p in found["smileid-sdk-rust"]], [(7, True), (8, False)])
         self.assertTrue(any(str(m).startswith("::warning::Could not mark u7 ready") for m in printed))
 
+    def test_promote_carries_on_when_a_repo_cannot_be_listed(self):
+        green = [{"__typename": "CheckRun", "status": "COMPLETED", "conclusion": "SUCCESS"}]
+        listed = [{"number": 3, "url": "u3", "isDraft": False, "headRefName": "spec-sync/rolling",
+                   "statusCheckRollup": green, "isCrossRepository": False, "body": ""}]
+        printed = []
+
+        def fake_gh(args, token, **kwargs):
+            if "smileidentity/smileid-sdk-go" in args:
+                raise s.SpecSyncError("gh pr list failed (1): GraphQL: timeout")
+            return json.dumps(listed)
+
+        with mock.patch.object(s, "gh", fake_gh), mock.patch("builtins.print", printed.append):
+            found = s.promote_prs(["smileid-sdk-go", "smileid-sdk-js"], "t")
+        self.assertIsNone(found["smileid-sdk-go"])
+        self.assertEqual([p["number"] for p in found["smileid-sdk-js"]], [3])
+        self.assertTrue(any("Could not list the spec-sync pull requests in smileid-sdk-go" in str(m) for m in printed))
+        body = s.render_status_issue(prs=found, runs={}, pending=[], last_processed=None, run_url="r", now="n")
+        self.assertIn("| `smileid-sdk-go` | could not be read in this run |", body)
+
     def test_find_open_pr_skips_forks(self):
         listed = [{"number": 7, "url": "u7", "isDraft": True, "body": "fork", "isCrossRepository": True},
                   {"number": 8, "url": "u8", "isDraft": True, "body": "ours", "isCrossRepository": False}]

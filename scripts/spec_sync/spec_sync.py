@@ -828,11 +828,17 @@ def promote_prs(repos, token):
     """Mark green draft spec-sync PRs ready. Returns the open PRs per repo."""
     found = {}
     for repo in repos:
-        out = gh(
-            ["pr", "list", "--repo", f"{ORG}/{repo}", "--label", LABEL, "--state", "open",
-             "--json", "number,url,isDraft,body,headRefName,statusCheckRollup,isCrossRepository", "--limit", "50"],
-            token,
-        )
+        # One repository that can't be read must not stop the others or the status issue.
+        try:
+            out = gh(
+                ["pr", "list", "--repo", f"{ORG}/{repo}", "--label", LABEL, "--state", "open",
+                 "--json", "number,url,isDraft,body,headRefName,statusCheckRollup,isCrossRepository", "--limit", "50"],
+                token,
+            )
+        except SpecSyncError as e:
+            print(f"::warning::Could not list the spec-sync pull requests in {repo}: {e}")
+            found[repo] = None
+            continue
         prs = []
         for pr in json.loads(out or "[]"):
             if pr.get("isCrossRepository", True):
@@ -893,6 +899,11 @@ def render_status_issue(*, prs, runs, pending, last_processed, run_url, now):
     ]
     for repo in ALL_REPOS:
         repo_prs = prs.get(repo, [])
+        if repo_prs is None:
+            run = runs.get(repo)
+            run_text = f"{run['result']}, [{run['at']}]({run['run_url']})" if run else "not run yet"
+            lines.append(f"| `{repo}` | could not be read in this run | unknown | {run_text} |")
+            continue
         cells = []
         for pr in repo_prs:
             state_text = "draft" if pr["draft"] else "ready"
