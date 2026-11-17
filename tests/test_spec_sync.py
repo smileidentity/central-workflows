@@ -517,7 +517,8 @@ class PrepareAndPublishTest(unittest.TestCase):
         task = (self.ctx / "TASK.md").read_text()
         self.assertNotIn("{{", task)
         for text in ("smileidentity/smileid-sdk-go", f"{self.ctx}/spec/v3.12.0/openapi.yaml",
-                     "rolling spec-sync pull request", "There is no open pull request yet.", f"{self.ctx}/fixtures"):
+                     "rolling spec-sync pull request", "There is no open pull request yet.", f"{self.ctx}/fixtures",
+                     "`x-smile-token-product`"):
             self.assertIn(text, task)
         self.assertIn("Added phone.", (self.ctx / "summaries.md").read_text())
         lambda_text = (self.ctx / "lambda-prs.md").read_text()
@@ -631,6 +632,7 @@ class PrepareAndPublishTest(unittest.TestCase):
                       state_dir=self.state, template=TEMPLATE, token="", read_token="")
         task = (self.ctx / "TASK.md").read_text()
         self.assertIn("scripts/build_cases.py", task)
+        self.assertNotIn("x-smile-token-product", task)
         self.assertIn("no token could read lambda", (self.ctx / "lambda-prs.md").read_text())
 
     def test_publish_without_a_bundle(self):
