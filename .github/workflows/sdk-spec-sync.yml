@@ -599,7 +599,9 @@ jobs:
           private-key: ${{ secrets.SMILE_GHA_BOT_PRIVATE_KEY }}
           owner: smileidentity
           repositories: smileid-sdk-go,smileid-sdk-java,smileid-sdk-js,smileid-sdk-php,smileid-sdk-python,smileid-sdk-ruby,smileid-sdk-rust,smileid-sdk-fixtures
-          permission-contents: read
+          # Marking a draft ready in a private repository needs contents write;
+          # with read, GitHub refuses it ("Resource not accessible by integration").
+          permission-contents: write
           permission-pull-requests: write
           permission-checks: read
           permission-statuses: read

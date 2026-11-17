@@ -393,10 +393,10 @@ class GuardTest(unittest.TestCase):
 
 class StatusTest(unittest.TestCase):
     def test_checks_state(self):
-        ok = {"__typename": "CheckRun", "status": "COMPLETED", "conclusion": "SUCCESS"}
-        skipped = {"__typename": "CheckRun", "status": "COMPLETED", "conclusion": "SKIPPED"}
-        running = {"__typename": "CheckRun", "status": "IN_PROGRESS", "conclusion": ""}
-        failed = {"__typename": "CheckRun", "status": "COMPLETED", "conclusion": "FAILURE"}
+        ok = {"__typename": "CheckRun", "name": "build", "status": "COMPLETED", "conclusion": "SUCCESS"}
+        skipped = {"__typename": "CheckRun", "name": "e2e", "status": "COMPLETED", "conclusion": "SKIPPED"}
+        running = {"__typename": "CheckRun", "name": "lint", "status": "IN_PROGRESS", "conclusion": ""}
+        failed = {"__typename": "CheckRun", "name": "test", "status": "COMPLETED", "conclusion": "FAILURE"}
         ctx_ok = {"__typename": "StatusContext", "state": "SUCCESS"}
         ctx_pending = {"__typename": "StatusContext", "state": "PENDING"}
         ctx_error = {"__typename": "StatusContext", "state": "ERROR"}
@@ -407,6 +407,16 @@ class StatusTest(unittest.TestCase):
         self.assertEqual(s.checks_state([ctx_pending, ok]), "pending")
         self.assertEqual(s.checks_state([running, failed]), "failure")
         self.assertEqual(s.checks_state([ctx_error]), "failure")
+        # A run cancelled by a newer run of the same workflow doesn't count.
+        def job(conclusion, started, status="COMPLETED"):
+            return {"__typename": "CheckRun", "workflowName": "Quality gates", "name": "coverage",
+                    "status": status, "conclusion": conclusion, "startedAt": started}
+        old_cancelled = job("CANCELLED", "2026-11-17T17:01:12Z")
+        self.assertEqual(s.checks_state([old_cancelled, job("SUCCESS", "2026-11-17T17:01:16Z")]), "success")
+        self.assertEqual(s.checks_state([job("SUCCESS", "2026-11-17T17:01:12Z"),
+                                         job("CANCELLED", "2026-11-17T17:01:16Z")]), "failure")
+        self.assertEqual(s.checks_state([old_cancelled, job("", None, "QUEUED")]), "pending")
+        self.assertEqual(s.checks_state([old_cancelled]), "failure")
 
     def test_promote(self):
         green = [{"__typename": "CheckRun", "status": "COMPLETED", "conclusion": "SUCCESS"}]
@@ -433,6 +443,44 @@ class StatusTest(unittest.TestCase):
         prs = found["smileid-sdk-go"]
         self.assertEqual([(p["number"], p["draft"], p["checks"]) for p in prs],
                          [(3, False, "success"), (4, True, "success"), (5, True, "none")])
+
+    def test_promote_carries_on_when_ready_fails(self):
+        green = [{"__typename": "CheckRun", "status": "COMPLETED", "conclusion": "SUCCESS"}]
+        body = s.write_marker(s.PR_MARKER, {"ready_ok": True})
+        listed = [{"number": n, "url": f"u{n}", "isDraft": True, "headRefName": "spec-sync/rolling",
+                   "statusCheckRollup": green, "isCrossRepository": False, "body": body} for n in (7, 8)]
+        printed = []
+
+        def fake_gh(args, token, **kwargs):
+            if args[:2] == ["pr", "list"]:
+                return json.dumps(listed)
+            if args[2] == "7":
+                raise s.SpecSyncError("gh pr ready failed (1): Resource not accessible by integration")
+            return ""
+
+        with mock.patch.object(s, "gh", fake_gh), mock.patch("builtins.print", printed.append):
+            found = s.promote_prs(["smileid-sdk-rust"], "t")
+        self.assertEqual([(p["number"], p["draft"]) for p in found["smileid-sdk-rust"]], [(7, True), (8, False)])
+        self.assertTrue(any(str(m).startswith("::warning::Could not mark u7 ready") for m in printed))
+
+    def test_promote_carries_on_when_a_repo_cannot_be_listed(self):
+        green = [{"__typename": "CheckRun", "status": "COMPLETED", "conclusion": "SUCCESS"}]
+        listed = [{"number": 3, "url": "u3", "isDraft": False, "headRefName": "spec-sync/rolling",
+                   "statusCheckRollup": green, "isCrossRepository": False, "body": ""}]
+        printed = []
+
+        def fake_gh(args, token, **kwargs):
+            if "smileidentity/smileid-sdk-go" in args:
+                raise s.SpecSyncError("gh pr list failed (1): GraphQL: timeout")
+            return json.dumps(listed)
+
+        with mock.patch.object(s, "gh", fake_gh), mock.patch("builtins.print", printed.append):
+            found = s.promote_prs(["smileid-sdk-go", "smileid-sdk-js"], "t")
+        self.assertIsNone(found["smileid-sdk-go"])
+        self.assertEqual([p["number"] for p in found["smileid-sdk-js"]], [3])
+        self.assertTrue(any("Could not list the spec-sync pull requests in smileid-sdk-go" in str(m) for m in printed))
+        body = s.render_status_issue(prs=found, runs={}, pending=[], last_processed=None, run_url="r", now="n")
+        self.assertIn("| `smileid-sdk-go` | could not be read in this run |", body)
 
     def test_find_open_pr_skips_forks(self):
         listed = [{"number": 7, "url": "u7", "isDraft": True, "body": "fork", "isCrossRepository": True},

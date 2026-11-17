@@ -901,6 +901,10 @@ def checks_state(rollup):
     if not rollup:
         return "none"
     state = "success"
+    # A newer run of a workflow can cancel an older one on the same commit, for
+    # example when a label is added just after a push. The rollup keeps both, so
+    # judge each check by its latest run, unless a run of it is still going.
+    latest, running = {}, set()
     for item in rollup:
         if item.get("__typename") == "StatusContext" or "state" in item and "status" not in item:
             value = (item.get("state") or "").upper()
@@ -908,11 +912,16 @@ def checks_state(rollup):
                 state = "pending"
             elif value != "SUCCESS":
                 return "failure"
-        else:
-            if (item.get("status") or "").upper() != "COMPLETED":
-                state = "pending"
-            elif (item.get("conclusion") or "").upper() not in ("SUCCESS", "NEUTRAL", "SKIPPED"):
-                return "failure"
+            continue
+        key = (item.get("workflowName") or "", item.get("name") or "")
+        if (item.get("status") or "").upper() != "COMPLETED":
+            state = "pending"
+            running.add(key)
+        elif key not in latest or (item.get("startedAt") or "") > (latest[key].get("startedAt") or ""):
+            latest[key] = item
+    for key, item in latest.items():
+        if key not in running and (item.get("conclusion") or "").upper() not in ("SUCCESS", "NEUTRAL", "SKIPPED"):
+            return "failure"
     return state
 
 
@@ -920,11 +929,17 @@ def promote_prs(repos, token):
     """Mark green draft spec-sync PRs ready. Returns the open PRs per repo."""
     found = {}
     for repo in repos:
-        out = gh(
-            ["pr", "list", "--repo", f"{ORG}/{repo}", "--label", LABEL, "--state", "open",
-             "--json", "number,url,isDraft,body,headRefName,statusCheckRollup,isCrossRepository", "--limit", "50"],
-            token,
-        )
+        # One repository that can't be read must not stop the others or the status issue.
+        try:
+            out = gh(
+                ["pr", "list", "--repo", f"{ORG}/{repo}", "--label", LABEL, "--state", "open",
+                 "--json", "number,url,isDraft,body,headRefName,statusCheckRollup,isCrossRepository", "--limit", "50"],
+                token,
+            )
+        except SpecSyncError as e:
+            print(f"::warning::Could not list the spec-sync pull requests in {repo}: {e}")
+            found[repo] = None
+            continue
         prs = []
         for pr in json.loads(out or "[]"):
             if pr.get("isCrossRepository", True):
@@ -933,9 +948,14 @@ def promote_prs(repos, token):
             checks = checks_state(pr.get("statusCheckRollup"))
             draft = pr.get("isDraft", False)
             if draft and checks == "success" and marker.get("ready_ok"):
-                gh(["pr", "ready", str(pr["number"]), "--repo", f"{ORG}/{repo}"], token)
-                print(f"Marked {pr['url']} ready for review")
-                draft = False
+                # One PR that can't be marked ready must not stop the others or the status issue.
+                try:
+                    gh(["pr", "ready", str(pr["number"]), "--repo", f"{ORG}/{repo}"], token)
+                except SpecSyncError as e:
+                    print(f"::warning::Could not mark {pr['url']} ready for review: {e}")
+                else:
+                    print(f"Marked {pr['url']} ready for review")
+                    draft = False
             prs.append({"number": pr["number"], "url": pr["url"], "draft": draft, "checks": checks,
                         "branch": pr.get("headRefName", ""), "spec_tag": marker.get("spec_tag", "")})
         found[repo] = sorted(prs, key=lambda p: p["number"])
@@ -987,6 +1007,11 @@ def render_status_issue(*, prs, runs, pending, last_processed, run_url, now, syn
     ]
     for repo in ALL_REPOS:
         repo_prs = prs.get(repo, [])
+        if repo_prs is None:
+            run = runs.get(repo)
+            run_text = f"{run['result']}, [{run['at']}]({run['run_url']})" if run else "not run yet"
+            lines.append(f"| `{repo}` | could not be read in this run | unknown | {run_text} |")
+            continue
         cells = []
         for pr in repo_prs:
             state_text = "draft" if pr["draft"] else "ready"
