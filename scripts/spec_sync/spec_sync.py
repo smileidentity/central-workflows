@@ -619,7 +619,13 @@ SDK_NOTE = (
     "method), make it. Do not list persona cases as a gap: an operation that has a cases file is covered. "
     "Only if an operation you add has no cases file, say so in your summary, not as a gap: the cases are "
     "generated from sandbox, so this run can't add one. A lookup on an existing job, such as a GET for its "
-    "status or news, needs no cases file of its own."
+    "status or news, needs no cases file of its own.\n\n"
+    "Token products: an operation's `x-smile-token-product` is the `product` claim the API requires in its "
+    "token. An operation without it requires a token with no `product` claim. Take each operation's product "
+    "from this extension in the spec, not from a table kept by hand: if this SDK has a hand-kept table of "
+    "paths to products, replace it with one taken from the spec, and keep the way the SDK sets the claim. "
+    "An operation whose only change is this extension still needs this change. Check the claim, or its "
+    "absence, in the golden fixture tests for every operation whose product changed."
 )
 FIXTURES_NOTE = (
     "This repository holds the shared integration cases. `personas.json` and `cases/` are generated: "
