@@ -369,7 +369,10 @@ jobs:
           prompt: |
             Read ${{ runner.temp }}/spec-sync/TASK.md and carry out the task it describes in this repository.
             Finish by writing the two result files it asks for.
+          # From v1.0.273 the action starts prompt sessions in auto mode, where a
+          # safety review can allow tools outside --allowedTools. Keep the list strict.
           claude_args: >-
+            --permission-mode default
             --max-turns 300
             --add-dir ${{ runner.temp }}/spec-sync
             --allowedTools Bash,Read,Write,Edit,MultiEdit,Glob,Grep,TodoWrite
