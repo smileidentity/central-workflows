@@ -1,0 +1,47 @@
+{
+  "breaking": true,
+  "lambda_prs": [
+    5266
+  ],
+  "previous_tag": "v3.1191.0",
+  "processed_at": "2026-11-18 06:15 UTC",
+  "processed_by": "https://github.com/smileidentity/central-workflows/actions/runs/44249732338",
+  "processed_repos": {
+    "smileid-sdk-fixtures": {
+      "at": "2026-11-18 06:15 UTC",
+      "by": "https://github.com/smileidentity/central-workflows/actions/runs/44249732338"
+    },
+    "smileid-sdk-go": {
+      "at": "2026-11-18 06:15 UTC",
+      "by": "https://github.com/smileidentity/central-workflows/actions/runs/44249732338"
+    },
+    "smileid-sdk-java": {
+      "at": "2026-11-18 06:15 UTC",
+      "by": "https://github.com/smileidentity/central-workflows/actions/runs/44249732338"
+    },
+    "smileid-sdk-js": {
+      "at": "2026-11-18 06:15 UTC",
+      "by": "https://github.com/smileidentity/central-workflows/actions/runs/44249732338"
+    },
+    "smileid-sdk-php": {
+      "at": "2026-11-18 06:15 UTC",
+      "by": "https://github.com/smileidentity/central-workflows/actions/runs/44249732338"
+    },
+    "smileid-sdk-python": {
+      "at": "2026-11-18 06:15 UTC",
+      "by": "https://github.com/smileidentity/central-workflows/actions/runs/44249732338"
+    },
+    "smileid-sdk-ruby": {
+      "at": "2026-11-18 06:15 UTC",
+      "by": "https://github.com/smileidentity/central-workflows/actions/runs/44249732338"
+    },
+    "smileid-sdk-rust": {
+      "at": "2026-11-18 06:15 UTC",
+      "by": "https://github.com/smileidentity/central-workflows/actions/runs/44249732338"
+    }
+  },
+  "received_at": "2026-11-18 06:08 UTC",
+  "run_url": "https://github.com/smileidentity/central-workflows/actions/runs/44249143578",
+  "summary": "# API Changelog 3.0.0 vs. 3.0.0\n\n\n## API Changes\n\n### POST /v3/aml/sync\n- :warning: the `people/items/addresses/items/` response's property `type` changed from `object` to `string` for status `200`\n- :warning: the `people/items/aliases/items/` response's property `type` changed from `object` to `string` for status `200`\n- :warning: the `people/items/dates_of_birth/items/` response's property `type` changed from `object` to `string` for status `200`\n- :warning: the `people/items/nationalities/items/` response's property `type` changed from `object` to `string` for status `200`\n\n\n\n\n## Info\n-  a breaking change was detected but the version is still `3.0.0`\n\n\n\n\n",
+  "tag": "v3.1192.0"
+}
