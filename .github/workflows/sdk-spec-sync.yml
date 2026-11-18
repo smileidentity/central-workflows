@@ -371,12 +371,14 @@ jobs:
             Finish by writing the two result files it asks for.
           # Auto mode sends every Bash command through a safety review, because it
           # ignores the broad Bash rule below. Default mode would run them unreviewed.
-          # The review can also allow a tool outside --allowedTools.
+          # The review can also allow a tool outside --allowedTools, so the network
+          # tools are denied outright: a deny rule wins over the review.
           claude_args: >-
             --permission-mode auto
             --max-turns 300
             --add-dir ${{ runner.temp }}/spec-sync
             --allowedTools Bash,Read,Write,Edit,MultiEdit,Glob,Grep,TodoWrite
+            --disallowedTools WebFetch,WebSearch
             --model ${{ vars.SDK_SPEC_SYNC_MODEL }}
 
       # claude-code-action points `origin` at this repository, so a fetch by

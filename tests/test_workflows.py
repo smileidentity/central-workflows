@@ -49,8 +49,13 @@ class ClaudePermissionTest(unittest.TestCase):
         # The last --permission-mode wins. Auto mode sends every Bash command
         # through the safety review; default mode would run them unreviewed.
         modes = re.findall(r"--permission-mode (\S+)", SPEC_SYNC)
-        self.assertTrue(modes)
-        self.assertEqual(modes[-1], "auto")
+        self.assertEqual(set(modes), {"auto"})
+        self.assertNotIn("--dangerously-skip-permissions", SPEC_SYNC)
+        self.assertNotIn("bypassPermissions", SPEC_SYNC)
+
+    def test_claude_cannot_use_network_tools(self):
+        (denied,) = re.findall(r"--disallowedTools (\S+)", SPEC_SYNC)
+        self.assertLessEqual({"WebFetch", "WebSearch"}, set(denied.split(",")))
 
 
 class KeepaliveTest(unittest.TestCase):
