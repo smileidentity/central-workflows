@@ -44,6 +44,15 @@ class ToolchainTest(unittest.TestCase):
         self.assertRegex(version.strip(), r"^'\d+\.\d+\.x'$")
 
 
+class ClaudePermissionTest(unittest.TestCase):
+    def test_claude_runs_in_auto_mode(self):
+        # The last --permission-mode wins. Auto mode sends every Bash command
+        # through the safety review; default mode would run them unreviewed.
+        modes = re.findall(r"--permission-mode (\S+)", SPEC_SYNC)
+        self.assertTrue(modes)
+        self.assertEqual(modes[-1], "auto")
+
+
 class KeepaliveTest(unittest.TestCase):
     def test_every_scheduled_workflow_is_kept_alive(self):
         (listed,) = re.findall(r"^\s+WORKFLOWS: (.+)$", SPEC_SYNC, re.MULTILINE)
