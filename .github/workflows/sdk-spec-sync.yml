@@ -271,7 +271,7 @@ jobs:
           version: v2.14.0
           install-only: true
       - if: matrix.repo == 'smileid-sdk-java'
-        uses: actions/setup-java@77dd5b2ce225ea11469928ac317850245a74ae78 # v6.2.0
+        uses: actions/setup-java@d1374f8ac74474200d16ef8ecee22c7ae7a51880 # v6.3.0
         with:
           distribution: temurin
           java-version: '21'
@@ -355,7 +355,7 @@ jobs:
       # This job has no write token. Claude edits the working tree; the publish job pushes.
       # Its output stays out of the logs, which are public in this repository.
       - id: claude
-        uses: anthropics/claude-code-action@925afb53776cf1a2b738c6bdbed37b4d4000ef13 # v1.0.262
+        uses: anthropics/claude-code-action@f3b070c88125d33dbae5653df5f143101d4ea9dc # v1.0.276
         env:
           # The Bedrock role allows one model, so Claude Code's background
           # requests to its smaller model use the same one.
@@ -369,10 +369,16 @@ jobs:
           prompt: |
             Read ${{ runner.temp }}/spec-sync/TASK.md and carry out the task it describes in this repository.
             Finish by writing the two result files it asks for.
+          # Auto mode sends every Bash command through a safety review, because it
+          # ignores the broad Bash rule below. Default mode would run them unreviewed.
+          # The review can also allow a tool outside --allowedTools, so the network
+          # tools are denied outright: a deny rule wins over the review.
           claude_args: >-
+            --permission-mode auto
             --max-turns 300
             --add-dir ${{ runner.temp }}/spec-sync
             --allowedTools Bash,Read,Write,Edit,MultiEdit,Glob,Grep,TodoWrite
+            --disallowedTools WebFetch,WebSearch
             --model ${{ vars.SDK_SPEC_SYNC_MODEL }}
 
       # claude-code-action points `origin` at this repository, so a fetch by
