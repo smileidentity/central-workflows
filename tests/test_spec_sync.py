@@ -320,6 +320,118 @@ class PlanTest(unittest.TestCase):
         with self.assertRaises(s.SpecSyncError):
             s.plan(self.pending, latest_api_tag="v3.20.0", api_tags=["v3.20.0"])
 
+    def test_open_prs_behind_the_spec_are_refreshed(self):
+        # The AML case: a scoped PR written against v3.1188.0 is open when v3.1192.0
+        # changes AML types. main has no AML code, so the rolling job alone changes nothing.
+        open_prs = {"smileid-sdk-rust": [
+            {"branch": "spec-sync/aml", "kind": "scoped", "spec_tag": "v3.1188.0", "scope": "AML operations"},
+            {"branch": "spec-sync/rolling", "kind": "rolling", "spec_tag": "v3.1188.0"},
+            {"branch": "spec-sync/breaking-v3.1190.0", "kind": "breaking", "spec_tag": "v3.1190.0"},
+            {"branch": "spec-sync/current", "kind": "scoped", "spec_tag": "v3.1192.0", "scope": "Phone"},
+        ]}
+        pending = [record("v3.1192.0", "v3.1191.0", prs=[5266])]
+        p = s.plan(pending, latest_api_tag="v3.1192.0", api_tags=["v3.1188.0", "v3.1190.0", "v3.1192.0"],
+                   open_prs=open_prs)
+        rust = [i for i in p["matrix"]["include"] if i["repo"] == "smileid-sdk-rust"]
+        self.assertEqual([(i["branch"], i["kind"], i["base_tag"], i["spec_tag"], i.get("refresh", False), i["tags"])
+                          for i in rust],
+                         [("spec-sync/rolling", "rolling", "v3.1190.0", "v3.1192.0", False, ["v3.1192.0"]),
+                          ("spec-sync/aml", "scoped", "v3.1188.0", "v3.1192.0", True, []),
+                          ("spec-sync/breaking-v3.1190.0", "breaking", "v3.1190.0", "v3.1192.0", True, [])])
+        self.assertEqual(rust[1]["scope"], "AML operations")
+        # Other repositories have no open PRs, so only their rolling job runs.
+        self.assertEqual([i["branch"] for i in p["matrix"]["include"] if i["repo"] == "smileid-sdk-go"],
+                         ["spec-sync/rolling"])
+        # A refresh consumes no lambda releases.
+        self.assertEqual(p["tags"], ["v3.1192.0"])
+
+    def test_refresh_runs_with_nothing_pending(self):
+        open_prs = {"smileid-sdk-go": [{"branch": "spec-sync/rolling", "kind": "rolling", "spec_tag": "v3.10.0"}]}
+        p = s.plan([], latest_api_tag="v3.12.0", open_prs=open_prs)
+        self.assertTrue(p["has_work"])
+        self.assertFalse(p["mark_processed"])
+        (u,) = p["matrix"]["include"]
+        self.assertEqual((u["repo"], u["base_tag"], u["spec_tag"], u["refresh"]), ("smileid-sdk-go", "v3.10.0", "v3.12.0", True))
+
+    def test_refresh_skips_what_it_cannot_or_need_not_do(self):
+        open_prs = {"smileid-sdk-go": [
+            {"branch": "spec-sync/aml", "kind": "scoped", "spec_tag": "v3.10.0", "scope": ""},
+            {"branch": "spec-sync/odd", "kind": "unknown", "spec_tag": "v3.10.0"},
+            {"branch": "feature/x", "kind": "rolling", "spec_tag": "v3.10.0"},
+            {"branch": "spec-sync/rolling", "kind": "rolling", "spec_tag": ""},
+            {"branch": "spec-sync/rolling", "kind": "rolling", "spec_tag": "v3.13.0"},
+        ]}
+        printed = []
+        with mock.patch("builtins.print", printed.append):
+            p = s.plan([], latest_api_tag="v3.12.0", open_prs=open_prs)
+        self.assertFalse(p["has_work"])
+        self.assertTrue(any("no recorded scope" in str(m) for m in printed))
+        # Hourly runs and scoped runs never refresh.
+        self.assertFalse(s.plan([], latest_api_tag="v3.12.0", sync_due=False, open_prs=open_prs)["has_work"])
+        behind = {"smileid-sdk-go": [{"branch": "spec-sync/rolling", "kind": "rolling", "spec_tag": "v3.1.0"}]}
+        scoped = s.plan([], from_tag="v3.1.0", scope="AML", latest_api_tag="v3.12.0", repos="go", open_prs=behind)
+        self.assertEqual([i["branch"] for i in scoped["matrix"]["include"]], ["spec-sync/aml"])
+
+    def test_plan_command_lists_open_prs_with_its_token(self):
+        state = tempfile.mkdtemp()
+        tags = Path(state) / "tags.txt"
+        tags.write_text("v3.12.0\n")
+        out = Path(state) / "out.txt"
+        body = s.write_marker(s.PR_MARKER, {"spec_tag": "v3.11.0", "kind": "rolling"})
+        listed = [{"number": 3, "url": "u3", "title": "Sync with the API spec at v3.11.0", "body": body,
+                   "headRefName": "spec-sync/rolling", "isCrossRepository": False}]
+        tokens = []
+
+        def fake_gh(args, token, **kwargs):
+            tokens.append(token)
+            return json.dumps(listed) if "smileidentity/smileid-sdk-go" in args else "[]"
+
+        env = {"GITHUB_OUTPUT": str(out), "OPEN_PRS_TOKEN": "reader"}
+        with mock.patch.dict(os.environ, env), mock.patch.object(s, "gh", fake_gh), mock.patch("builtins.print"):
+            self.assertEqual(s.main(["plan", "--state-dir", state, "--api-tags-file", str(tags)]), 0)
+        self.assertEqual(set(tokens), {"reader"})
+        self.assertEqual(len(tokens), len(s.ALL_REPOS))
+        matrix = json.loads(out.read_text().split("matrix<<SPEC_SYNC_EOF\n")[1].split("\n")[0])
+        self.assertEqual([(i["repo"], i["base_tag"], i["refresh"]) for i in matrix["include"]],
+                         [("smileid-sdk-go", "v3.11.0", True)])
+        # Without the token the plan carries on with a warning.
+        printed = []
+        with mock.patch.dict(os.environ, {"GITHUB_OUTPUT": str(out)}), mock.patch.dict(os.environ, {"OPEN_PRS_TOKEN": ""}), \
+                mock.patch("builtins.print", printed.append):
+            self.assertEqual(s.main(["plan", "--state-dir", state, "--api-tags-file", str(tags)]), 0)
+        self.assertTrue(any("are not refreshed" in str(m) for m in printed))
+
+    def test_open_pr_info(self):
+        marker = s.write_marker(s.PR_MARKER, {"spec_tag": "v3.10.0", "kind": "scoped", "scope": "AML"})
+        self.assertEqual(s.open_pr_info({"number": 1, "url": "u", "headRefName": "spec-sync/aml", "body": marker}),
+                         {"number": 1, "url": "u", "branch": "spec-sync/aml", "kind": "scoped",
+                          "spec_tag": "v3.10.0", "scope": "AML"})
+        # PRs opened before the marker recorded the scope or the kind.
+        legacy = s.write_marker(s.PR_MARKER, {"spec_tag": "v3.10.0"})
+        info = s.open_pr_info({"headRefName": "spec-sync/aml-operations", "body": legacy,
+                               "title": "Sync AML operations with the API spec at v3.10.0"})
+        self.assertEqual((info["kind"], info["scope"]), ("scoped", "AML operations"))
+        self.assertEqual(s.open_pr_info({"headRefName": "spec-sync/rolling", "body": legacy})["kind"], "rolling")
+        self.assertEqual(s.open_pr_info({"headRefName": "spec-sync/breaking-v3.9.0", "body": ""})["kind"], "breaking")
+        self.assertEqual(s.open_pr_info({"headRefName": "spec-sync/x", "body": "", "title": "Other"})["scope"], "")
+
+    def test_list_open_prs(self):
+        listed = [{"number": 1, "headRefName": "spec-sync/rolling", "isCrossRepository": False, "body": ""},
+                  {"number": 2, "headRefName": "spec-sync/rolling", "isCrossRepository": True, "body": ""},
+                  {"number": 3, "headRefName": "my-branch", "isCrossRepository": False, "body": ""}]
+        printed = []
+
+        def fake_gh(args, token, **kwargs):
+            if "smileidentity/smileid-sdk-java" in args:
+                raise s.SpecSyncError("gh pr list failed (1): timeout")
+            return json.dumps(listed)
+
+        with mock.patch.object(s, "gh", fake_gh), mock.patch("builtins.print", printed.append):
+            found = s.list_open_prs(["smileid-sdk-go", "smileid-sdk-java"], "t")
+        self.assertEqual([p["number"] for p in found["smileid-sdk-go"]], [1])
+        self.assertNotIn("smileid-sdk-java", found)
+        self.assertTrue(any("so none are refreshed" in str(m) for m in printed))
+
 
 class BodyTest(unittest.TestCase):
     def test_marker_round_trip(self):
@@ -443,6 +555,61 @@ class StatusTest(unittest.TestCase):
         prs = found["smileid-sdk-go"]
         self.assertEqual([(p["number"], p["draft"], p["checks"]) for p in prs],
                          [(3, False, "success"), (4, True, "success"), (5, True, "none")])
+
+    def test_promote_holds_back_prs_behind_the_spec_and_closes_empty_ones(self):
+        green = [{"__typename": "CheckRun", "status": "COMPLETED", "conclusion": "SUCCESS"}]
+
+        def pr(number, spec_tag, draft, changed=3):
+            return {"number": number, "url": f"u{number}", "isDraft": draft, "headRefName": f"spec-sync/b{number}",
+                    "statusCheckRollup": green, "isCrossRepository": False, "changedFiles": changed,
+                    "body": s.write_marker(s.PR_MARKER, {"ready_ok": True, "spec_tag": spec_tag})}
+
+        listed = [pr(2, "v3.11.0", draft=False), pr(3, "v3.11.0", draft=True), pr(4, "v3.12.0", draft=True),
+                  pr(5, "v3.12.0", draft=False, changed=0)]
+        calls, printed = [], []
+
+        def fake_gh(args, token, **kwargs):
+            calls.append(args)
+            return json.dumps(listed) if args[:2] == ["pr", "list"] else ""
+
+        with mock.patch.object(s, "gh", fake_gh), mock.patch("builtins.print", printed.append):
+            found = s.promote_prs(["smileid-sdk-go"], "t", "v3.12.0")
+        self.assertIn(["pr", "ready", "2", "--repo", "smileidentity/smileid-sdk-go", "--undo"], calls)
+        self.assertEqual([c[2] for c in calls if c[:2] == ["pr", "ready"] and "--undo" not in c], ["4"])
+        close = next(c for c in calls if c[:2] == ["pr", "close"])
+        self.assertEqual(close[2], "5")
+        self.assertIn("--delete-branch", close)
+        prs = found["smileid-sdk-go"]
+        self.assertEqual([(p["number"], p["draft"], p["behind"]) for p in prs],
+                         [(2, True, True), (3, True, True), (4, False, False)])
+        body = s.render_status_issue(prs=found, runs={}, pending=[], last_processed="v3.12.0", run_url=RUN, now=NOW)
+        self.assertIn("[#2](u2) draft, checks green, behind the spec (written against `v3.11.0`), waiting for the next sync",
+                      body)
+        # Without the newest tag nothing is held back.
+        calls.clear()
+        with mock.patch.object(s, "gh", fake_gh), mock.patch("builtins.print"):
+            s.promote_prs(["smileid-sdk-go"], "t")
+        self.assertFalse(any("--undo" in c for c in calls))
+
+    def test_promote_carries_on_when_closing_or_undoing_fails(self):
+        green = [{"__typename": "CheckRun", "status": "COMPLETED", "conclusion": "SUCCESS"}]
+        listed = [{"number": 6, "url": "u6", "isDraft": False, "headRefName": "spec-sync/a", "statusCheckRollup": green,
+                   "isCrossRepository": False, "changedFiles": 0, "body": ""},
+                  {"number": 7, "url": "u7", "isDraft": False, "headRefName": "spec-sync/b", "statusCheckRollup": green,
+                   "isCrossRepository": False, "changedFiles": 1,
+                   "body": s.write_marker(s.PR_MARKER, {"spec_tag": "v3.1.0"})}]
+        printed = []
+
+        def fake_gh(args, token, **kwargs):
+            if args[:2] == ["pr", "list"]:
+                return json.dumps(listed)
+            raise s.SpecSyncError("not allowed")
+
+        with mock.patch.object(s, "gh", fake_gh), mock.patch("builtins.print", printed.append):
+            found = s.promote_prs(["smileid-sdk-go"], "t", "v3.2.0")
+        self.assertEqual([(p["number"], p["draft"]) for p in found["smileid-sdk-go"]], [(6, False), (7, False)])
+        self.assertTrue(any("Could not close u6" in str(m) for m in printed))
+        self.assertTrue(any("Could not move u7 back to draft" in str(m) for m in printed))
 
     def test_promote_carries_on_when_ready_fails(self):
         green = [{"__typename": "CheckRun", "status": "COMPLETED", "conclusion": "SUCCESS"}]
@@ -730,6 +897,79 @@ class PrepareAndPublishTest(unittest.TestCase):
                          (["v3.10.0", "v3.12.0"], "v3.12.0", [1, 404, 5100], False))
         self.assertIn("Added address.", fake.body)
         self.assertIn("Coverage is 98%.", fake.body)
+
+    def open_scoped_pr(self, summary="Added `ScreenAml`."):
+        """An earlier scoped run left spec-sync/aml with one file, written against v3.10.0."""
+        sh(["git", "checkout", "-qb", "spec-sync/aml"], self.work)
+        (self.work / "aml.go").write_text("package smileid // v3.10.0 types\n")
+        sh(["git", "add", "-A"], self.work)
+        sh(["git", "-c", "user.name=t", "-c", "user.email=t@example.com", "commit", "-qm", "aml"], self.work)
+        sh(["git", "push", "-q", "origin", "spec-sync/aml"], self.work)
+        sh(["git", "checkout", "-q", "main"], self.work)
+        self.unit = {"repo": "smileid-sdk-go", "kind": "scoped", "branch": "spec-sync/aml", "base_tag": "v3.10.0",
+                     "spec_tag": "v3.12.0", "tags": [], "lambda_prs": [], "scope": "AML operations", "refresh": True}
+        u = {**self.unit, "spec_tag": "v3.10.0"}
+        body = s.render_pr_body(repo="smileid-sdk-go", u=u, tags=[], spec_tag="v3.10.0", lambda_prs=[], records=[],
+                                summary=summary, result={"checks": []}, ready_ok=True, run_url=RUN, now=NOW)
+        return {"number": 12, "url": "u12", "isDraft": False, "body": body, "isCrossRepository": False}
+
+    def test_refresh_of_a_scoped_pr(self):
+        pr = self.open_scoped_pr()
+        self.assertEqual(s.read_marker(pr["body"], s.PR_MARKER)["scope"], "AML operations")
+        fake = FakeGitHub(pr)
+        self.prepare(fake)
+        task = (self.ctx / "TASK.md").read_text()
+        self.assertIn("This run brings the open pull request up to date", task)
+        self.assertIn("Leave spec changes outside this pull request alone", task)
+        self.assertIn("Limit the change to this part of the spec: AML operations", task)
+        self.assertIn("describe the whole pull request", task)
+        self.assertEqual((self.ctx / "previous-summary.md").read_text(), "Added `ScreenAml`.\n")
+
+        self.claude(files={"aml.go": "package smileid // v3.12.0 types\n"})
+        self.assertEqual(self.publish(fake)["status"], "updated")
+        self.assertIn("v3.12.0 types", sh(["git", "--git-dir", str(self.remote), "show", "spec-sync/aml:aml.go"]))
+        marker = s.read_marker(fake.body, s.PR_MARKER)
+        self.assertEqual((marker["spec_tag"], marker["scope"], marker["kind"]), ("v3.12.0", "AML operations", "scoped"))
+        self.assertIn("Sync AML operations with the API spec at v3.12.0", next(c for c in fake.calls if c[:2] == ["pr", "edit"]))
+
+    def test_refresh_that_changes_nothing_keeps_the_summary(self):
+        fake = FakeGitHub(self.open_scoped_pr())
+        self.prepare(fake)
+        self.claude(status="no_change", files={})
+        (self.ctx / "out" / "summary.md").write_text("Nothing in the AML operations changed.")
+        self.assertEqual(self.publish(fake)["status"], "updated")
+        self.assertIn("Added `ScreenAml`.", fake.body)
+        self.assertNotIn("Nothing in the AML operations changed.", fake.body)
+        self.assertEqual(s.read_marker(fake.body, s.PR_MARKER)["spec_tag"], "v3.12.0")
+        # Nothing was pushed, so the PR keeps its ready state.
+        self.assertFalse(any(c[:2] == ["pr", "ready"] for c in fake.calls))
+
+    def test_rolling_refresh_takes_every_change(self):
+        self.unit.update(refresh=True, base_tag="v3.10.0", tags=[], lambda_prs=[])
+        self.prepare(FakeGitHub())
+        self.assertIn("Make every change between the two spec tags", (self.ctx / "TASK.md").read_text())
+
+    def test_pr_that_no_longer_changes_anything_is_closed(self):
+        pr = self.open_scoped_pr()
+        # The same change reaches main another way.
+        (self.work / "aml.go").write_text("package smileid // v3.10.0 types\n")
+        sh(["git", "add", "-A"], self.work)
+        sh(["git", "-c", "user.name=t", "-c", "user.email=t@example.com", "commit", "-qm", "aml on main"], self.work)
+        sh(["git", "push", "-q", "origin", "main"], self.work)
+        fake = FakeGitHub(pr)
+        self.prepare(fake)
+        self.claude(status="no_change", files={})
+        self.assertEqual(self.publish(fake)["status"], "closed")
+        close = next(c for c in fake.calls if c[:2] == ["pr", "close"])
+        self.assertEqual((close[2], close[4]), ("12", "smileidentity/smileid-sdk-go"))
+        self.assertIn("--delete-branch", close)
+        self.assertFalse(any(c[:2] == ["pr", "edit"] for c in fake.calls))
+        self.assertEqual(s.synced_by_run({"include": [self.unit]}, {}, [{"repo": "smileid-sdk-go",
+                                                                       "branch": "spec-sync/aml", "status": "closed"}]),
+                         {})
+        runs = s.update_last_runs({}, [{"repo": "smileid-sdk-go", "status": "closed"}], ["smileid-sdk-go"], RUN, NOW,
+                                  "success")
+        self.assertEqual(runs["smileid-sdk-go"]["result"], "closed an empty PR")
 
     def test_merge_conflict_is_left_for_claude(self):
         sh(["git", "checkout", "-qb", "spec-sync/rolling"], self.work)

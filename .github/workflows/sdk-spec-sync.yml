@@ -5,10 +5,13 @@ name: SDK spec sync
 # each change. Non-breaking changes go in one rolling PR per repository
 # (spec-sync/rolling); each breaking release gets its own PR
 # (spec-sync/breaking-<tag>). PRs open as drafts, and descriptions are rewritten
-# in place, never commented on.
+# in place, never commented on. Each daily run also refreshes any open
+# spec-sync PR written against an older spec than the newest api-reference tag.
 #
 # Every hour, the status job marks draft spec-sync PRs ready once all their
-# checks pass, and rewrites the pinned "SDK spec sync status" issue.
+# checks pass, moves PRs that are behind the newest spec back to draft until
+# they are refreshed, closes PRs that no longer change anything, and rewrites
+# the pinned "SDK spec sync status" issue.
 #
 # Claude never shares a runner with a write token. The sync job, with only
 # read tokens, runs Claude and bundles its change as a patch, encrypted to
@@ -101,6 +104,21 @@ jobs:
         with:
           persist-credentials: false
 
+      # Read-only, to find open spec-sync PRs that are behind the spec so this run
+      # refreshes them. Without it the plan carries on and refreshes none.
+      - id: open-prs-token
+        if: steps.secrets.outputs.configured == 'true' && (github.event_name != 'schedule' || github.event.schedule == env.SYNC_CRON)
+        continue-on-error: true
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ secrets.SPEC_SYNC_READER_CLIENT_ID }}
+          private-key: ${{ secrets.SPEC_SYNC_READER_PRIVATE_KEY }}
+          owner: smileidentity
+          repositories: smileid-sdk-go,smileid-sdk-java,smileid-sdk-js,smileid-sdk-php,smileid-sdk-python,smileid-sdk-ruby,smileid-sdk-rust,smileid-sdk-fixtures
+          permission-pull-requests: read
+          # Don't revoke the token: it expires after an hour.
+          skip-token-revoke: true
+
       - id: plan
         name: Plan the jobs
         if: steps.secrets.outputs.configured == 'true'
@@ -109,6 +127,7 @@ jobs:
           SCOPE: ${{ inputs.scope }}
           REPOS: ${{ inputs.repos }}
           SYNC_DUE: ${{ github.event_name != 'schedule' || github.event.schedule == env.SYNC_CRON }}
+          OPEN_PRS_TOKEN: ${{ steps.open-prs-token.outputs.token }}
         run: |
           # Without pipefail, a failed ls-remote leaves an empty tag list and a misleading error later.
           set -o pipefail
@@ -636,9 +655,17 @@ jobs:
             mkdir -p "$state"
           fi
           mkdir -p "$RUNNER_TEMP/results"
+          # PRs behind the newest api-reference tag go back to draft until a sync refreshes them.
+          # If the tags can't be listed, the status job leaves draft states alone.
+          tags="$RUNNER_TEMP/api-tags.txt"
+          if ! (set -o pipefail; git ls-remote --tags --refs https://github.com/smileidentity/api-reference.git \
+              | sed 's#.*refs/tags/##' > "$tags"); then
+            echo "::warning::Could not list the api-reference tags, so no PR is checked against the newest spec."
+            : > "$tags"
+          fi
           python3 scripts/spec_sync/spec_sync.py status --state-dir "$state" --results-dir "$RUNNER_TEMP/results" \
             --planned-repos "$REPOS" --sync-result "$SYNC_RESULT" --run-url "$RUN_URL" \
-            --body-file "$RUNNER_TEMP/status-issue.md"
+            --body-file "$RUNNER_TEMP/status-issue.md" --api-tags-file "$tags"
 
   # GitHub turns off a public repository's scheduled workflows after 60 days with
   # no repository activity. Enabling a workflow through the API restarts that
