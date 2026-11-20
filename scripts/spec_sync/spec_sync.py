@@ -553,6 +553,163 @@ def render_pr_body(*, repo, u, tags, spec_tag, lambda_prs, records, summary, res
 
 
 # ---------------------------------------------------------------------------
+# Spec changes
+#
+# The workflow lists every change between the two spec tags itself, and Claude
+# must say what it did about each one. Without the list, a change Claude didn't
+# notice goes unmentioned: Java's AML PR claimed spec v3.1192.0 but kept the
+# v3.1188.0 types for AmlPersonMatch.
+
+
+HTTP_METHODS = ("get", "put", "post", "delete", "patch", "head", "options", "trace")
+# Keys that change only documentation, not what an SDK sends or parses.
+DOC_KEYS = {"description", "summary", "example", "examples", "externalDocs", "title", "x-codeSamples"}
+SPEC_CHANGE_OUTCOMES = ("changed", "already_matches", "not_applicable")
+MAX_LISTED_GAPS = 20
+
+
+def strip_docs(node):
+    if isinstance(node, dict):
+        return {k: strip_docs(v) for k, v in node.items() if k not in DOC_KEYS}
+    if isinstance(node, list):
+        return [strip_docs(v) for v in node]
+    return node
+
+
+def hidden(node):
+    return isinstance(node, dict) and (node.get("x-internal") is True or bool(node.get("x-smile-sdk-exclude")))
+
+
+def public_operations(spec):
+    ops = {}
+    for path, item in ((spec or {}).get("paths") or {}).items():
+        if not isinstance(item, dict) or hidden(item):
+            continue
+        shared = strip_docs({k: v for k, v in item.items() if k not in HTTP_METHODS})
+        for method in HTTP_METHODS:
+            op = item.get(method)
+            if isinstance(op, dict) and not hidden(op):
+                ops[f"{method.upper()} {path}"] = {"shared": shared, **strip_docs(op)}
+    return ops
+
+
+def public_schemas(spec):
+    schemas = ((spec or {}).get("components") or {}).get("schemas") or {}
+    return {name: strip_docs(s) for name, s in schemas.items() if not hidden(s)}
+
+
+def changed_keys(old, new):
+    return sorted(k for k in set(old) | set(new) if old.get(k) != new.get(k))
+
+
+def spec_changes(old, new):
+    """Every change between two OpenAPI documents that can affect an SDK.
+
+    Returns a list of {"id", "change"}. Operations are compared whole, naming
+    the parts that changed. Schemas are compared property by property, so a
+    changed field type is its own entry. Documentation-only changes and anything
+    marked x-internal or x-smile-sdk-exclude are left out.
+    """
+    changes = []
+
+    def add(item_id, change):
+        changes.append({"id": item_id, "change": change})
+
+    old_ops, new_ops = public_operations(old), public_operations(new)
+    for key in sorted(set(old_ops) | set(new_ops)):
+        if key not in old_ops:
+            add(f"operation {key}", "added")
+        elif key not in new_ops:
+            add(f"operation {key}", "removed")
+        elif old_ops[key] != new_ops[key]:
+            add(f"operation {key}", "changed: " + ", ".join(changed_keys(old_ops[key], new_ops[key])))
+
+    old_schemas, new_schemas = public_schemas(old), public_schemas(new)
+    for name in sorted(set(old_schemas) | set(new_schemas)):
+        if name not in old_schemas:
+            add(f"schema {name}", "added")
+            continue
+        if name not in new_schemas:
+            add(f"schema {name}", "removed")
+            continue
+        before, after = old_schemas[name], new_schemas[name]
+        if before == after:
+            continue
+        old_props = before.get("properties") or {} if isinstance(before, dict) else {}
+        new_props = after.get("properties") or {} if isinstance(after, dict) else {}
+        for prop in sorted(set(old_props) | set(new_props)):
+            if prop not in old_props:
+                add(f"schema {name}.{prop}", "added")
+            elif prop not in new_props:
+                add(f"schema {name}.{prop}", "removed")
+            elif old_props[prop] != new_props[prop]:
+                old_prop, new_prop = old_props[prop], new_props[prop]
+                parts = changed_keys(old_prop, new_prop) if isinstance(old_prop, dict) and isinstance(new_prop, dict) \
+                    else ["value"]
+                add(f"schema {name}.{prop}", "changed: " + ", ".join(parts))
+        if isinstance(before, dict) and isinstance(after, dict):
+            rest = [k for k in changed_keys(before, after) if k != "properties"]
+            if rest:
+                add(f"schema {name}", "changed: " + ", ".join(rest))
+        elif before != after:
+            add(f"schema {name}", "changed")
+    return changes
+
+
+def load_spec(spec_dir, tag):
+    """The spec at a tag, converted to JSON by the workflow (openapi.json beside openapi.yaml)."""
+    path = Path(spec_dir) / tag / "openapi.json"
+    data = read_json(path)
+    return data if isinstance(data, dict) else None
+
+
+def render_spec_changes(changes, base_tag, spec_tag):
+    if not changes:
+        return f"The workflow found no change between `{base_tag}` and `{spec_tag}` that can affect an SDK.\n"
+    lines = [f"Changes between `{base_tag}` and `{spec_tag}`, listed by the workflow. Each needs an entry in "
+             "`spec_changes` in result.json.", "", "| id | change |", "|---|---|"]
+    lines += [f"| `{c['id']}` | {c['change']} |" for c in changes]
+    return "\n".join(lines) + "\n"
+
+
+def spec_change_gaps(changes, reported, changed_files):
+    """Gaps for listed spec changes that Claude's result doesn't account for.
+
+    Each change needs an entry with an outcome. "changed" must name files this
+    PR changes; "already_matches" and "not_applicable" need a reason.
+    """
+    by_id = {}
+    for entry in reported if isinstance(reported, list) else []:
+        if isinstance(entry, dict) and isinstance(entry.get("id"), str):
+            by_id[entry["id"]] = entry
+    changed = set(changed_files)
+    missing, unproven = [], []
+    for change in changes:
+        entry = by_id.get(change["id"])
+        outcome = entry.get("outcome") if entry else None
+        if outcome not in SPEC_CHANGE_OUTCOMES:
+            missing.append(change["id"])
+        elif outcome == "changed":
+            files = entry.get("files") if isinstance(entry.get("files"), list) else []
+            if not any(isinstance(f, str) and f in changed for f in files):
+                unproven.append(change["id"])
+        elif not str(entry.get("reason") or "").strip():
+            missing.append(change["id"])
+
+    def listed(ids):
+        shown = ", ".join(f"`{i}`" for i in ids[:MAX_LISTED_GAPS])
+        return shown + (f" and {len(ids) - MAX_LISTED_GAPS} more" if len(ids) > MAX_LISTED_GAPS else "")
+
+    gaps = []
+    if missing:
+        gaps.append(f"Claude did not account for {len(missing)} spec change(s) the workflow found: {listed(missing)}.")
+    if unproven:
+        gaps.append(f"Claude said it changed the code for {len(unproven)} spec change(s), but named no file this "
+                    f"pull request changes: {listed(unproven)}.")
+    return gaps
+
+
+# ---------------------------------------------------------------------------
 # Guards
 
 
@@ -705,10 +862,42 @@ def prepare(*, u, repo, workdir, ctx, state_dir, template, token, read_token):
             "`git add` the resolved files, but do not commit." if conflict else ""
         ),
         "repo_note": FIXTURES_NOTE if repo == FIXTURES_REPO else SDK_NOTE.format(ctx=ctx),
+        "spec_changes_note": spec_changes_note(u, ctx, repo),
     }
     (ctx / "TASK.md").write_text(render_task(template, values))
     return {"repo": repo, "default": default, "base": base, "default_sha": default_sha, "pr": pr,
             "conflict": conflict, "previous": previous, "unit": u}
+
+
+def checks_spec_changes(repo):
+    """The fixtures repository has no models to keep in step, so only the SDKs are checked."""
+    return repo in SDK_REPOS
+
+
+def spec_changes_note(u, ctx, repo):
+    """Write the workflow's list of spec changes for Claude, and say how to report on it."""
+    if not checks_spec_changes(repo):
+        return ""
+    old, new = load_spec(Path(ctx) / "spec", u["base_tag"]), load_spec(Path(ctx) / "spec", u["spec_tag"])
+    if old is None or new is None:
+        return ("The workflow could not list the spec changes for this run, so compare the two spec files "
+                "yourself and leave `spec_changes` out of result.json.")
+    path = Path(ctx) / "spec-changes.md"
+    path.write_text(render_spec_changes(spec_changes(old, new), u["base_tag"], u["spec_tag"]))
+    return (
+        f"`{path}` lists every change between the two spec tags that can affect an SDK, found by the workflow. "
+        "Go through every entry, including ones you think need nothing: this list is how a change you would "
+        "otherwise miss gets noticed, such as a field whose type changed. In result.json, `spec_changes` must "
+        "have one entry for each id in the list, with an `outcome`:\n"
+        "   - `changed`: you changed the SDK for it. `files` lists the files you changed for it, relative to the "
+        "repository root.\n"
+        "   - `already_matches`: the SDK already matches the newer spec. `reason` says where, such as the file "
+        "and type.\n"
+        "   - `not_applicable`: it doesn't apply to this pull request, for example because it is outside its "
+        "scope. `reason` says why.\n"
+        "   The publish job checks every id has an entry, and that each `changed` entry names a file this pull "
+        "request changes. A missing or unproven entry keeps the pull request a draft."
+    )
 
 
 SDK_NOTE = (
@@ -762,7 +951,7 @@ def package(*, u, workdir, ctx, base, default_sha, dest):
     return meta
 
 
-def publish(*, u, workdir, bundle, out, state_dir, write_token, bot_name, bot_email, run_url, now):
+def publish(*, u, workdir, bundle, out, state_dir, write_token, bot_name, bot_email, run_url, now, spec_dir=None):
     """Check the sync job's patch and push it, from a fresh clone.
 
     Runs in its own job, after Claude's job has ended. Nothing it uses comes
@@ -865,6 +1054,17 @@ def publish(*, u, workdir, bundle, out, state_dir, write_token, bot_name, bot_em
     spec_tag = max([u["spec_tag"], *([previous["spec_tag"]] if previous.get("spec_tag") else [])], key=tag_key)
     lambda_prs = sorted(set(previous.get("lambda_prs", [])) | set(u["lambda_prs"]))
     records = [r for r in (find_record(state_dir, t) for t in tags) if r]
+    if checks_spec_changes(repo):
+        # The specs come from the publish job's own download, not the sync job's runner.
+        old = load_spec(spec_dir, u["base_tag"]) if spec_dir else None
+        new = load_spec(spec_dir, u["spec_tag"]) if spec_dir else None
+        if old is None or new is None:
+            extra = [f"The publish job could not read the spec at `{u['base_tag']}` and `{u['spec_tag']}`, so it "
+                     "could not check that every spec change was handled."]
+        else:
+            extra = spec_change_gaps(spec_changes(old, new), result.get("spec_changes"), changed_files)
+        if extra:
+            result = {**result, "gaps": [*(result.get("gaps") or []), *extra]}
     ready_ok = result["status"] != "blocked" and not result.get("gaps")
     if result["status"] == "no_change" and not pr:
         ready_ok = False
@@ -1111,6 +1311,7 @@ def main(argv=None):
     p.add_argument("--bot-name", required=True)
     p.add_argument("--bot-email", required=True)
     p.add_argument("--run-url", required=True)
+    p.add_argument("--spec-dir", default="", help="<tag>/openapi.json for the unit's two spec tags")
 
     p = sub.add_parser("mark-processed")
     p.add_argument("--state-dir", default=".")
@@ -1162,7 +1363,7 @@ def main(argv=None):
         elif args.command == "publish":
             publish(u=json.loads(args.unit), workdir=args.workdir, bundle=args.bundle, out=args.out,
                     state_dir=args.state_dir, write_token=os.environ["WRITE_TOKEN"], bot_name=args.bot_name,
-                    bot_email=args.bot_email, run_url=args.run_url, now=now_utc())
+                    bot_email=args.bot_email, run_url=args.run_url, now=now_utc(), spec_dir=args.spec_dir or None)
         elif args.command == "mark-processed":
             if args.tags:
                 done = json.loads(args.tags)

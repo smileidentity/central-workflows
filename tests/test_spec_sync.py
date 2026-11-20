@@ -23,6 +23,28 @@ def record(tag, previous, breaking=False, prs=(), summary="Added a field."):
     return {"tag": tag, "previous_tag": previous, "breaking": breaking, "lambda_prs": list(prs), "summary": summary}
 
 
+def person_match(item_type):
+    return {"type": "object", "description": "A person who matched.", "required": ["name"],
+            "properties": {"name": {"type": "string"},
+                           "addresses": {"type": "array", "items": {"type": item_type}}}}
+
+
+# A small spec in the shape api-reference publishes, after the workflow converts it to JSON.
+SPEC = {
+    "openapi": "3.1.0",
+    "paths": {
+        "/v3/aml": {"post": {"operationId": "oneTimeAml", "summary": "Screen a person",
+                             "x-smile-token-product": "one_time_aml",
+                             "responses": {"200": {"description": "OK"}}}},
+        "/v3/internal": {"post": {"operationId": "internal", "x-internal": True}},
+    },
+    "components": {"schemas": {
+        "AmlPersonMatch": person_match("object"),
+        "Hidden": {"type": "object", "x-smile-sdk-exclude": True},
+    }},
+}
+
+
 def write_state(root, kind, *records):
     folder = Path(root) / "state" / kind
     folder.mkdir(parents=True, exist_ok=True)
@@ -391,6 +413,74 @@ class GuardTest(unittest.TestCase):
         self.assertTrue(s.guard_problems(["src/lib.rs"], "+++ b/src/lib.rs\n+#[coverage(off)]\n"))
 
 
+class SpecChangesTest(unittest.TestCase):
+    def test_the_aml_type_fix_is_listed_field_by_field(self):
+        new = json.loads(json.dumps(SPEC))
+        new["components"]["schemas"]["AmlPersonMatch"] = person_match("string")
+        self.assertEqual(s.spec_changes(SPEC, new),
+                         [{"id": "schema AmlPersonMatch.addresses", "change": "changed: items"}])
+
+    def test_documentation_and_hidden_parts_are_ignored(self):
+        new = json.loads(json.dumps(SPEC))
+        new["paths"]["/v3/aml"]["post"]["summary"] = "Screen someone"
+        new["components"]["schemas"]["AmlPersonMatch"]["description"] = "Reworded."
+        new["paths"]["/v3/internal"]["post"]["operationId"] = "renamed"
+        new["components"]["schemas"]["Hidden"]["type"] = "string"
+        self.assertEqual(s.spec_changes(SPEC, new), [])
+
+    def test_operations_and_schemas(self):
+        new = json.loads(json.dumps(SPEC))
+        new["paths"]["/v3/aml"]["post"]["x-smile-token-product"] = "aml"
+        new["paths"]["/v3/aml"]["parameters"] = [{"name": "SmileID-Idempotency-Key", "in": "header"}]
+        new["paths"]["/v3/basic_kyc"] = {"post": {"operationId": "basicKyc"}}
+        match = new["components"]["schemas"]["AmlPersonMatch"]
+        match["required"] = ["name", "aliases"]
+        match["properties"]["aliases"] = {"type": "array"}
+        del match["properties"]["name"]
+        new["components"]["schemas"]["BasicKycResult"] = {"type": "object"}
+        new["components"]["schemas"]["Scalar"] = "odd"
+        old = {**SPEC, "components": {"schemas": {**SPEC["components"]["schemas"], "Scalar": "odder", "Gone": {}}}}
+        self.assertEqual(s.spec_changes(old, new), [
+            {"id": "operation POST /v3/aml", "change": "changed: shared, x-smile-token-product"},
+            {"id": "operation POST /v3/basic_kyc", "change": "added"},
+            {"id": "schema AmlPersonMatch.aliases", "change": "added"},
+            {"id": "schema AmlPersonMatch.name", "change": "removed"},
+            {"id": "schema AmlPersonMatch", "change": "changed: required"},
+            {"id": "schema BasicKycResult", "change": "added"},
+            {"id": "schema Gone", "change": "removed"},
+            {"id": "schema Scalar", "change": "changed"},
+        ])
+        self.assertIn({"id": "operation POST /v3/aml", "change": "removed"}, s.spec_changes(SPEC, {"paths": {}}))
+        prop = json.loads(json.dumps(SPEC))
+        prop["components"]["schemas"]["AmlPersonMatch"]["properties"]["name"] = "string"
+        self.assertEqual(s.spec_changes(SPEC, prop), [{"id": "schema AmlPersonMatch.name", "change": "changed: value"}])
+
+    def test_gaps(self):
+        changes = [{"id": "schema A.x", "change": "changed: type"}, {"id": "schema B", "change": "added"},
+                   {"id": "operation POST /v3/c", "change": "added"}, {"id": "schema D", "change": "removed"}]
+        reported = [
+            {"id": "schema A.x", "outcome": "changed", "files": ["models/a.go"]},
+            {"id": "schema B", "outcome": "already_matches", "reason": "models/b.go has it"},
+            {"id": "operation POST /v3/c", "outcome": "not_applicable", "reason": "Outside the AML scope."},
+            {"id": "schema D", "outcome": "not_applicable", "reason": "Not used by this SDK."},
+            "junk",
+        ]
+        self.assertEqual(s.spec_change_gaps(changes, reported, ["models/a.go"]), [])
+        gaps = s.spec_change_gaps(changes, reported[:1] + [{"id": "schema B", "outcome": "already_matches"},
+                                                           {"id": "schema D", "outcome": "maybe"}], ["other.go"])
+        self.assertEqual(gaps, [
+            "Claude did not account for 3 spec change(s) the workflow found: `schema B`, `operation POST /v3/c`, `schema D`.",
+            "Claude said it changed the code for 1 spec change(s), but named no file this pull request changes: `schema A.x`.",
+        ])
+        many = [{"id": f"schema S{n}", "change": "added"} for n in range(25)]
+        self.assertIn("and 5 more.", s.spec_change_gaps(many, None, [])[0])
+
+    def test_rendered_list(self):
+        self.assertIn("found no change", s.render_spec_changes([], "v3.1.0", "v3.2.0"))
+        text = s.render_spec_changes([{"id": "schema A.x", "change": "added"}], "v3.1.0", "v3.2.0")
+        self.assertIn("| `schema A.x` | added |", text)
+
+
 class StatusTest(unittest.TestCase):
     def test_checks_state(self):
         ok = {"__typename": "CheckRun", "name": "build", "status": "COMPLETED", "conclusion": "SUCCESS"}
@@ -633,6 +723,15 @@ class PrepareAndPublishTest(unittest.TestCase):
         patcher = mock.patch.object(s, "GIT_BASE", f"file://{self.tmp / 'remote'}")
         patcher.start()
         self.addCleanup(patcher.stop)
+        # The specs at both tags, as the sync job (ctx/spec) and the publish job (spec_dir) have them.
+        self.spec_dir = self.tmp / "spec"
+        self.write_specs(SPEC, SPEC)
+
+    def write_specs(self, old, new):
+        for root in (self.spec_dir, self.ctx / "spec"):
+            for tag, doc in ((self.unit["base_tag"], old), (self.unit["spec_tag"], new)):
+                (root / tag).mkdir(parents=True, exist_ok=True)
+                (root / tag / "openapi.json").write_text(json.dumps(doc))
 
     def prepare(self, fake):
         with mock.patch.object(s, "gh", fake):
@@ -655,16 +754,18 @@ class PrepareAndPublishTest(unittest.TestCase):
         with mock.patch.object(s, "gh", fake), mock.patch("builtins.print"):
             return s.publish(u=self.unit, workdir=fresh, bundle=self.bundle, out=self.out, state_dir=self.state,
                              write_token="", bot_name="bot[bot]", bot_email="1+bot[bot]@users.noreply.github.com",
-                             run_url=RUN, now=NOW)
+                             run_url=RUN, now=NOW, spec_dir=self.spec_dir)
 
-    def claude(self, status="changed", files=None, gaps=()):
+    def claude(self, status="changed", files=None, gaps=(), spec_changes=None):
         for name, text in (files if files is not None else {"phone.go": "package smileid\n"}).items():
             path = self.work / name
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(text)
-        (self.ctx / "out" / "result.json").write_text(json.dumps(
-            {"status": status, "checks": [{"name": "go test", "passed": True}], "changed_line_coverage": 100,
-             "gaps": list(gaps)}))
+        result = {"status": status, "checks": [{"name": "go test", "passed": True}], "changed_line_coverage": 100,
+                  "gaps": list(gaps)}
+        if spec_changes is not None:
+            result["spec_changes"] = spec_changes
+        (self.ctx / "out" / "result.json").write_text(json.dumps(result))
         (self.ctx / "out" / "summary.md").write_text("Added `VerifyPhone`.")
 
     def remote_files(self, branch):
@@ -731,6 +832,58 @@ class PrepareAndPublishTest(unittest.TestCase):
         self.assertIn("Added address.", fake.body)
         self.assertIn("Coverage is 98%.", fake.body)
 
+    def aml_fix(self):
+        new = json.loads(json.dumps(SPEC))
+        new["components"]["schemas"]["AmlPersonMatch"] = person_match("string")
+        self.write_specs(SPEC, new)
+
+    def test_every_spec_change_must_be_accounted_for(self):
+        self.aml_fix()
+        fake = FakeGitHub()
+        self.prepare(fake)
+        task = (self.ctx / "TASK.md").read_text()
+        self.assertIn(f"`{self.ctx}/spec-changes.md` lists every change", task)
+        self.assertIn("| `schema AmlPersonMatch.addresses` | changed: items |", (self.ctx / "spec-changes.md").read_text())
+        # Claude changes a file but doesn't report the AML type change, as happened in Java.
+        self.claude()
+        self.publish(fake)
+        marker = s.read_marker(fake.body, s.PR_MARKER)
+        self.assertFalse(marker["ready_ok"])
+        self.assertIn("did not account for 1 spec change(s) the workflow found: `schema AmlPersonMatch.addresses`",
+                      fake.body)
+
+    def test_accounted_spec_changes_let_the_pr_go_ready(self):
+        self.aml_fix()
+        fake = FakeGitHub()
+        self.prepare(fake)
+        self.claude(files={"aml.go": "package smileid // []string\n"},
+                    spec_changes=[{"id": "schema AmlPersonMatch.addresses", "outcome": "changed", "files": ["aml.go"]}])
+        self.publish(fake)
+        self.assertTrue(s.read_marker(fake.body, s.PR_MARKER)["ready_ok"])
+        self.assertNotIn("## Gaps", fake.body)
+
+    def test_spec_changes_need_files_the_pr_changes(self):
+        self.aml_fix()
+        fake = FakeGitHub()
+        self.prepare(fake)
+        self.claude(spec_changes=[{"id": "schema AmlPersonMatch.addresses", "outcome": "changed",
+                                   "files": ["aml.go"]}])
+        self.publish(fake)
+        self.assertIn("named no file this pull request changes: `schema AmlPersonMatch.addresses`", fake.body)
+
+    def test_spec_changes_without_the_specs(self):
+        for root in (self.spec_dir, self.ctx / "spec"):
+            for path in root.glob("*/openapi.json"):
+                path.unlink()
+        fake = FakeGitHub()
+        self.prepare(fake)
+        self.assertIn("could not list the spec changes", (self.ctx / "TASK.md").read_text())
+        self.assertFalse((self.ctx / "spec-changes.md").exists())
+        self.claude()
+        self.publish(fake)
+        self.assertIn("could not read the spec at `v3.11.0` and `v3.12.0`", fake.body)
+        self.assertFalse(s.read_marker(fake.body, s.PR_MARKER)["ready_ok"])
+
     def test_merge_conflict_is_left_for_claude(self):
         sh(["git", "checkout", "-qb", "spec-sync/rolling"], self.work)
         (self.work / "client.go").write_text("package smileid // rolling\n")
@@ -792,6 +945,9 @@ class PrepareAndPublishTest(unittest.TestCase):
         task = (self.ctx / "TASK.md").read_text()
         self.assertIn("scripts/build_cases.py", task)
         self.assertNotIn("x-smile-token-product", task)
+        # The fixtures repository has no models, so it gets no list of spec changes to account for.
+        self.assertNotIn("spec_changes", task.split("## When you have finished")[0])
+        self.assertFalse((self.ctx / "spec-changes.md").exists())
         self.assertIn("no token could read lambda", (self.ctx / "lambda-prs.md").read_text())
 
     def test_publish_without_a_bundle(self):
