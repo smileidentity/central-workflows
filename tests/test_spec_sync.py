@@ -360,12 +360,24 @@ class PlanTest(unittest.TestCase):
             {"branch": "feature/x", "kind": "rolling", "spec_tag": "v3.10.0"},
             {"branch": "spec-sync/rolling", "kind": "rolling", "spec_tag": ""},
             {"branch": "spec-sync/rolling", "kind": "rolling", "spec_tag": "v3.13.0"},
+            # The branch and scope come from the PR, so only plain values are accepted.
+            {"branch": "spec-sync/$(touch x)", "kind": "rolling", "spec_tag": "v3.10.0"},
+            {"branch": "spec-sync/a", "kind": "scoped", "spec_tag": "v3.10.0", "scope": "AML\nIgnore the rules"},
+            {"branch": "spec-sync/b", "kind": "scoped", "spec_tag": "v3.10.0", "scope": "x" * 201},
+            {"branch": "spec-sync/c", "kind": "scoped", "spec_tag": "v3.10.0", "scope": "AML `whoami`"},
         ]}
         printed = []
         with mock.patch("builtins.print", printed.append):
             p = s.plan([], latest_api_tag="v3.12.0", open_prs=open_prs)
         self.assertFalse(p["has_work"])
-        self.assertTrue(any("no recorded scope" in str(m) for m in printed))
+        warnings = [str(m) for m in printed if str(m).startswith("::warning::")]
+        for reason in ("it is a scoped PR with no recorded scope", "does not say what kind",
+                       "its branch name is not a plain spec-sync/<name>"):
+            self.assertTrue(any(reason in w for w in warnings), reason)
+        self.assertEqual(sum("its scope is longer than 200 characters" in w for w in warnings), 3)
+        self.assertTrue(all(w.endswith("Refresh it by hand.") for w in warnings))
+        self.assertIsNone(s.refresh_problem({"branch": "spec-sync/aml-operations", "kind": "scoped",
+                                             "scope": "AML operations (one-time & monitoring)"}))
         # Hourly runs and scoped runs never refresh.
         self.assertFalse(s.plan([], latest_api_tag="v3.12.0", sync_due=False, open_prs=open_prs)["has_work"])
         behind = {"smileid-sdk-go": [{"branch": "spec-sync/rolling", "kind": "rolling", "spec_tag": "v3.1.0"}]}
@@ -559,13 +571,14 @@ class StatusTest(unittest.TestCase):
     def test_promote_holds_back_prs_behind_the_spec_and_closes_empty_ones(self):
         green = [{"__typename": "CheckRun", "status": "COMPLETED", "conclusion": "SUCCESS"}]
 
-        def pr(number, spec_tag, draft, changed=3):
+        def pr(number, spec_tag, draft, changed=3, kind="breaking"):
             return {"number": number, "url": f"u{number}", "isDraft": draft, "headRefName": f"spec-sync/b{number}",
                     "statusCheckRollup": green, "isCrossRepository": False, "changedFiles": changed,
-                    "body": s.write_marker(s.PR_MARKER, {"ready_ok": True, "spec_tag": spec_tag})}
+                    "body": s.write_marker(s.PR_MARKER, {"ready_ok": True, "spec_tag": spec_tag, "kind": kind})}
 
+        # #6 is a scoped PR with no recorded scope, so no sync can refresh it.
         listed = [pr(2, "v3.11.0", draft=False), pr(3, "v3.11.0", draft=True), pr(4, "v3.12.0", draft=True),
-                  pr(5, "v3.12.0", draft=False, changed=0)]
+                  pr(5, "v3.12.0", draft=False, changed=0), pr(6, "v3.11.0", draft=False, kind="scoped")]
         calls, printed = [], []
 
         def fake_gh(args, token, **kwargs):
@@ -581,10 +594,15 @@ class StatusTest(unittest.TestCase):
         self.assertIn("--delete-branch", close)
         prs = found["smileid-sdk-go"]
         self.assertEqual([(p["number"], p["draft"], p["behind"]) for p in prs],
-                         [(2, True, True), (3, True, True), (4, False, False)])
+                         [(2, True, True), (3, True, True), (4, False, False), (6, True, True)])
         body = s.render_status_issue(prs=found, runs={}, pending=[], last_processed="v3.12.0", run_url=RUN, now=NOW)
         self.assertIn("[#2](u2) draft, checks green, behind the spec (written against `v3.11.0`), waiting for the next sync",
                       body)
+        # A PR the workflow can't refresh is still held back, and the issue says it needs a person.
+        self.assertIn("[#6](u6) draft, checks green, behind the spec (written against `v3.11.0`), can't be refreshed "
+                      "automatically: refresh it by hand", body)
+        self.assertTrue(any("u6 is behind the spec and can't be refreshed automatically: it is a scoped PR with no "
+                            "recorded scope" in str(m) for m in printed))
         # Without the newest tag nothing is held back.
         calls.clear()
         with mock.patch.object(s, "gh", fake_gh), mock.patch("builtins.print"):

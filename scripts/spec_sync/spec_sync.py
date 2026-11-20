@@ -384,6 +384,30 @@ def map_units(units, api_tags):
     return kept, dropped
 
 
+REFRESH_BRANCH = re.compile(r"^spec-sync/[A-Za-z0-9._-]{1,100}$")
+MAX_SCOPE = 200
+
+
+def refresh_problem(pr):
+    """Why the workflow can't refresh an open PR (see open_pr_info), or None if it can.
+
+    A refresh takes its branch and scope from the PR, not from the workflow or a
+    maintainer, and the scope goes into Claude's prompt and the PR title. So only
+    plain branch names and short, single-line scopes are accepted.
+    """
+    if not REFRESH_BRANCH.match(pr.get("branch", "")):
+        return "its branch name is not a plain spec-sync/<name>"
+    if pr.get("kind") not in KINDS:
+        return "its description does not say what kind of spec-sync PR it is"
+    if pr.get("kind") == "scoped":
+        scope = pr.get("scope", "")
+        if not scope:
+            return "it is a scoped PR with no recorded scope"
+        if len(scope) > MAX_SCOPE or not re.fullmatch(r"[^\r\n`<>$]+", scope):
+            return "its scope is longer than 200 characters or has line breaks or characters such as ` < > $"
+    return None
+
+
 def refresh_units(open_prs, latest_api_tag, planned_branches):
     """Jobs that bring open spec-sync PRs up to the newest api-reference tag.
 
@@ -399,13 +423,12 @@ def refresh_units(open_prs, latest_api_tag, planned_branches):
         return units
     for pr in open_prs or []:
         branch, spec_tag, kind = pr.get("branch", ""), pr.get("spec_tag", ""), pr.get("kind", "")
-        if branch in planned_branches or not branch.startswith("spec-sync/") or kind not in KINDS:
+        if branch in planned_branches or not is_behind(spec_tag, latest_api_tag):
             continue
-        if not TAG_RE.match(spec_tag) or tag_key(spec_tag) >= tag_key(latest_api_tag):
-            continue
-        if kind == "scoped" and not pr.get("scope"):
-            print(f"::warning::{pr.get('url') or branch} is a scoped spec-sync PR with no recorded scope, "
-                  "so it was not refreshed")
+        problem = refresh_problem(pr)
+        if problem:
+            print(f"::warning::{pr.get('url') or branch} is behind the spec but was not refreshed: {problem}. "
+                  "Refresh it by hand.")
             continue
         u = unit(kind, branch, spec_tag, latest_api_tag, [], pr.get("scope", "") if kind == "scoped" else "")
         u["refresh"] = True
@@ -1086,7 +1109,7 @@ def promote_prs(repos, token, latest_api_tag=None):
         try:
             out = gh(
                 ["pr", "list", "--repo", f"{ORG}/{repo}", "--label", LABEL, "--state", "open",
-                 "--json", "number,url,isDraft,body,headRefName,statusCheckRollup,isCrossRepository,changedFiles",
+                 "--json", "number,url,title,isDraft,body,headRefName,statusCheckRollup,isCrossRepository,changedFiles",
                  "--limit", "50"],
                 token,
             )
@@ -1109,6 +1132,12 @@ def promote_prs(repos, token, latest_api_tag=None):
             checks = checks_state(pr.get("statusCheckRollup"))
             draft = pr.get("isDraft", False)
             behind = is_behind(marker.get("spec_tag"), latest_api_tag)
+            # A PR the workflow can't refresh is still held back, so it isn't merged with
+            # code the newer spec changed, but it needs a person to refresh it.
+            problem = refresh_problem(open_pr_info(pr)) if behind else None
+            if problem:
+                print(f"::warning::{pr['url']} is behind the spec and can't be refreshed automatically: {problem}. "
+                      "Refresh it by hand.")
             if behind and not draft:
                 try:
                     gh(["pr", "ready", str(pr["number"]), "--repo", f"{ORG}/{repo}", "--undo"], token)
@@ -1116,7 +1145,8 @@ def promote_prs(repos, token, latest_api_tag=None):
                     print(f"::warning::Could not move {pr['url']} back to draft: {e}")
                 else:
                     print(f"Moved {pr['url']} back to draft: it was written against {marker.get('spec_tag')}, "
-                          f"and the spec is now at {latest_api_tag}. The next sync refreshes it.")
+                          f"and the spec is now at {latest_api_tag}."
+                          + (" It needs refreshing by hand." if problem else " The next sync refreshes it."))
                     draft = True
             if draft and not behind and checks == "success" and marker.get("ready_ok"):
                 # One PR that can't be marked ready must not stop the others or the status issue.
@@ -1129,7 +1159,7 @@ def promote_prs(repos, token, latest_api_tag=None):
                     draft = False
             prs.append({"number": pr["number"], "url": pr["url"], "draft": draft, "checks": checks,
                         "branch": pr.get("headRefName", ""), "spec_tag": marker.get("spec_tag", ""),
-                        "behind": behind})
+                        "behind": behind, "refresh_problem": problem})
         found[repo] = sorted(prs, key=lambda p: p["number"])
     return found
 
@@ -1193,7 +1223,9 @@ def render_status_issue(*, prs, runs, pending, last_processed, run_url, now, syn
                       "none": "no checks yet"}[pr["checks"]]
             cell = f"[#{pr['number']}]({pr['url']}) {state_text}, {checks}"
             if pr.get("behind"):
-                cell += f", behind the spec (written against `{pr['spec_tag']}`), waiting for the next sync"
+                cell += f", behind the spec (written against `{pr['spec_tag']}`), " + (
+                    "can't be refreshed automatically: refresh it by hand" if pr.get("refresh_problem")
+                    else "waiting for the next sync")
             cells.append(cell)
         rolling = next((p for p in repo_prs if p["branch"] == ROLLING_BRANCH), None)
         spec_tag = (rolling or {}).get("spec_tag") or last_processed or ""
