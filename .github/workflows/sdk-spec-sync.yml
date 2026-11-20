@@ -282,16 +282,25 @@ jobs:
       - if: matrix.repo == 'smileid-sdk-php'
         uses: shivammathur/setup-php@eb7c497e18156a6bbabfef1d3a82760b9eda3962 # 2.40.0
         with:
-          php-version: '8.3'
+          # smileid-sdk-php's api-compat check (roave/backward-compatibility-check) needs PHP 8.4.
+          php-version: '8.4'
           coverage: pcov
           tools: composer
       - if: matrix.repo == 'smileid-sdk-ruby'
         uses: ruby/setup-ruby@b3aaceaef7e0ee231b499e7b5f49c03fc1d32199 # v1.338.0
         with:
           ruby-version: .ruby-version
+      # The same tools as smileid-sdk-rust's CI: the toolchain its rust-toolchain.toml names, the
+      # minimum supported Rust for the msrv build, and the pinned semver and coverage tools.
+      # Keep the versions in step with its quality-gates.yml and test.yml.
       - if: matrix.repo == 'smileid-sdk-rust'
         name: Set up Rust
-        run: rustup toolchain install stable --profile minimal --component clippy,rustfmt,llvm-tools-preview
+        run: |
+          rustup toolchain install --no-self-update
+          rustup component add llvm-tools-preview
+          rustup toolchain install 1.85 --profile minimal --no-self-update
+          cargo install cargo-semver-checks --version 0.51.0 --locked
+          cargo install cargo-llvm-cov --version 0.9.1 --locked
 
       - id: prepare
         name: Prepare the branch and Claude's instructions
