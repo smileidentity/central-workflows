@@ -884,6 +884,21 @@ class PrepareAndPublishTest(unittest.TestCase):
         self.assertIn("could not read the spec at `v3.11.0` and `v3.12.0`", fake.body)
         self.assertFalse(s.read_marker(fake.body, s.PR_MARKER)["ready_ok"])
 
+    def test_a_failed_conversion_counts_as_no_spec(self):
+        # A failed yq leaves an empty or partial openapi.json. That reads as no spec,
+        # so the run takes the same fallback as a missing file rather than crashing.
+        for root in (self.spec_dir, self.ctx / "spec"):
+            (root / "v3.12.0" / "openapi.json").write_text("")
+            (root / "v3.11.0" / "openapi.json").write_text('{"paths": ')
+        self.assertIsNone(s.load_spec(self.spec_dir, "v3.12.0"))
+        fake = FakeGitHub()
+        self.prepare(fake)
+        self.assertIn("could not list the spec changes", (self.ctx / "TASK.md").read_text())
+        self.claude()
+        self.assertEqual(self.publish(fake)["status"], "updated")
+        self.assertIn("could not read the spec at `v3.11.0` and `v3.12.0`", fake.body)
+        self.assertFalse(s.read_marker(fake.body, s.PR_MARKER)["ready_ok"])
+
     def test_merge_conflict_is_left_for_claude(self):
         sh(["git", "checkout", "-qb", "spec-sync/rolling"], self.work)
         (self.work / "client.go").write_text("package smileid // rolling\n")
