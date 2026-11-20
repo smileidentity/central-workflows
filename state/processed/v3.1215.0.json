@@ -1,0 +1,47 @@
+{
+  "breaking": false,
+  "lambda_prs": [
+    4836
+  ],
+  "previous_tag": "v3.1214.0",
+  "processed_at": "2026-11-20 06:21 UTC",
+  "processed_by": "https://github.com/smileidentity/central-workflows/actions/runs/44686375414",
+  "processed_repos": {
+    "smileid-sdk-fixtures": {
+      "at": "2026-11-20 06:21 UTC",
+      "by": "https://github.com/smileidentity/central-workflows/actions/runs/44686375414"
+    },
+    "smileid-sdk-go": {
+      "at": "2026-11-20 06:21 UTC",
+      "by": "https://github.com/smileidentity/central-workflows/actions/runs/44686375414"
+    },
+    "smileid-sdk-java": {
+      "at": "2026-11-20 06:21 UTC",
+      "by": "https://github.com/smileidentity/central-workflows/actions/runs/44686375414"
+    },
+    "smileid-sdk-js": {
+      "at": "2026-11-20 06:21 UTC",
+      "by": "https://github.com/smileidentity/central-workflows/actions/runs/44686375414"
+    },
+    "smileid-sdk-php": {
+      "at": "2026-11-20 06:21 UTC",
+      "by": "https://github.com/smileidentity/central-workflows/actions/runs/44686375414"
+    },
+    "smileid-sdk-python": {
+      "at": "2026-11-20 06:21 UTC",
+      "by": "https://github.com/smileidentity/central-workflows/actions/runs/44686375414"
+    },
+    "smileid-sdk-ruby": {
+      "at": "2026-11-20 06:21 UTC",
+      "by": "https://github.com/smileidentity/central-workflows/actions/runs/44686375414"
+    },
+    "smileid-sdk-rust": {
+      "at": "2026-11-20 06:21 UTC",
+      "by": "https://github.com/smileidentity/central-workflows/actions/runs/44686375414"
+    }
+  },
+  "received_at": "2026-11-19 23:18 UTC",
+  "run_url": "https://github.com/smileidentity/central-workflows/actions/runs/44636520890",
+  "summary": "# API Changelog 3.0.0 vs. 3.0.0\n\n\n## API Changes\n\n### POST /v3/basic_kyc\n-  endpoint added\n\n\n### POST /v3/basic_kyc/sync\n-  endpoint added\n\n\n\n\n\n\n",
+  "tag": "v3.1215.0"
+}
