@@ -598,6 +598,18 @@ def public_schemas(spec):
     return {name: strip_docs(s) for name, s in schemas.items() if not hidden(s)}
 
 
+def response_headers(op):
+    """Each response header an operation declares, with the statuses that return it."""
+    found = {}
+    responses = (op or {}).get("responses") or {}
+    for status in sorted(responses, key=str):
+        response = responses[status]
+        headers = response.get("headers") if isinstance(response, dict) else None
+        for name in (headers or {}) if isinstance(headers, dict) else ():
+            found.setdefault(name, []).append(str(status))
+    return found
+
+
 def changed_keys(old, new):
     return sorted(k for k in set(old) | set(new) if old.get(k) != new.get(k))
 
@@ -623,6 +635,21 @@ def spec_changes(old, new):
             add(f"operation {key}", "removed")
         elif old_ops[key] != new_ops[key]:
             add(f"operation {key}", "changed: " + ", ".join(changed_keys(old_ops[key], new_ops[key])))
+
+    # Response headers get their own entries. A header such as SmileID-Job-ID on
+    # a 408 is easy to miss inside a whole-operation entry, and an SDK that drops
+    # it leaves callers without a value the API sends them.
+    for key in sorted(new_ops):
+        before = response_headers(old_ops.get(key))
+        after = response_headers(new_ops[key])
+        for name in sorted(set(before) | set(after), key=str.lower):
+            item = f"response header {name} on {key}"
+            if name not in before:
+                add(item, f"added: returned with {', '.join(after[name])}")
+            elif name not in after:
+                add(item, "removed")
+            elif before[name] != after[name]:
+                add(item, f"changed: now returned with {', '.join(after[name])}")
 
     old_schemas, new_schemas = public_schemas(old), public_schemas(new)
     for name in sorted(set(old_schemas) | set(new_schemas)):
@@ -887,7 +914,9 @@ def spec_changes_note(u, ctx, repo):
     return (
         f"`{path}` lists every change between the two spec tags that can affect an SDK, found by the workflow. "
         "Go through every entry, including ones you think need nothing: this list is how a change you would "
-        "otherwise miss gets noticed, such as a field whose type changed. In result.json, `spec_changes` must "
+        "otherwise miss gets noticed, such as a field whose type changed. A `response header` entry is handled "
+        "only when a caller can read that header's value from what the SDK returns for each listed status: the "
+        "result for a success, and the error for an error status. In result.json, `spec_changes` must "
         "have one entry for each id in the list, with an `outcome`:\n"
         "   - `changed`: you changed the SDK for it. `files` lists the files you changed for it, relative to the "
         "repository root.\n"

@@ -455,6 +455,34 @@ class SpecChangesTest(unittest.TestCase):
         prop["components"]["schemas"]["AmlPersonMatch"]["properties"]["name"] = "string"
         self.assertEqual(s.spec_changes(SPEC, prop), [{"id": "schema AmlPersonMatch.name", "change": "changed: value"}])
 
+    def test_response_headers_get_their_own_entries(self):
+        # The Basic KYC case: SmileID-Job-ID comes back on a 408, where it is easy to drop.
+        def sync_op(*statuses_with_job_id):
+            responses = {"200": {"description": "OK", "headers": {"User-ID": {"schema": {"type": "string"}}}}}
+            for status in statuses_with_job_id:
+                responses[status] = {"description": "x", "headers": {"SmileID-Job-ID": {"schema": {"type": "string"}}}}
+            return {"post": {"operationId": "basicKycSync", "responses": responses}}
+
+        added = {**SPEC, "paths": {**SPEC["paths"], "/v3/basic_kyc/sync": sync_op("408", "500")}}
+        self.assertEqual(s.spec_changes(SPEC, added), [
+            {"id": "operation POST /v3/basic_kyc/sync", "change": "added"},
+            {"id": "response header SmileID-Job-ID on POST /v3/basic_kyc/sync", "change": "added: returned with 408, 500"},
+            {"id": "response header User-ID on POST /v3/basic_kyc/sync", "change": "added: returned with 200"},
+        ])
+        widened = {**SPEC, "paths": {**SPEC["paths"], "/v3/basic_kyc/sync": sync_op("408", "424", "500")}}
+        self.assertIn({"id": "response header SmileID-Job-ID on POST /v3/basic_kyc/sync",
+                       "change": "changed: now returned with 408, 424, 500"}, s.spec_changes(added, widened))
+        dropped = {**SPEC, "paths": {**SPEC["paths"], "/v3/basic_kyc/sync": sync_op()}}
+        self.assertIn({"id": "response header SmileID-Job-ID on POST /v3/basic_kyc/sync", "change": "removed"},
+                      s.spec_changes(added, dropped))
+        # A documentation change to a header is not a change.
+        reworded = json.loads(json.dumps(added))
+        reworded["paths"]["/v3/basic_kyc/sync"]["post"]["responses"]["408"]["headers"]["SmileID-Job-ID"]["description"] = "x"
+        self.assertEqual(s.spec_changes(added, reworded), [])
+        # Headers of a removed operation are covered by the operation's own entry.
+        self.assertEqual([c["id"] for c in s.spec_changes(added, SPEC)], ["operation POST /v3/basic_kyc/sync"])
+        self.assertEqual(s.response_headers({"responses": {"200": "odd", "201": {"headers": []}}}), {})
+
     def test_gaps(self):
         changes = [{"id": "schema A.x", "change": "changed: type"}, {"id": "schema B", "change": "added"},
                    {"id": "operation POST /v3/c", "change": "added"}, {"id": "schema D", "change": "removed"}]
