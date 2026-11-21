@@ -250,6 +250,9 @@ jobs:
               https://github.com/smileidentity/api-reference.git "$RUNNER_TEMP/api-reference-$tag"
             git -C "$RUNNER_TEMP/api-reference-$tag" sparse-checkout set specs/v3
             mv "$RUNNER_TEMP/api-reference-$tag/specs/v3" "$CTX/spec/$tag"
+            # The list of spec changes Claude must account for is built from JSON. yq is on the runner image.
+            yq -o=json '.' "$CTX/spec/$tag/openapi.yaml" > "$CTX/spec/$tag/openapi.json" \
+              || echo "::warning::Could not convert the spec at $tag to JSON, so Claude gets no list of spec changes."
           done
           if [ -n "$(git ls-remote "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY.git" refs/heads/spec-sync-state)" ]; then
             git clone --quiet --depth 1 --branch spec-sync-state "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY.git" "$STATE"
@@ -528,6 +531,24 @@ jobs:
           name: spec-sync-bundle-${{ strategy.job-index }}
           path: ${{ runner.temp }}/download
 
+      # The publish job lists the spec changes itself, from api-reference, to check
+      # Claude accounted for each one. If this fails, the PR stays a draft with a gap.
+      - name: Fetch the specs
+        continue-on-error: true
+        env:
+          BASE_TAG: ${{ matrix.base_tag }}
+          SPEC_TAG: ${{ matrix.spec_tag }}
+        run: |
+          for tag in "$BASE_TAG" "$SPEC_TAG"; do
+            dir="$RUNNER_TEMP/spec/$tag"
+            [ -f "$dir/openapi.json" ] && continue
+            git clone --quiet --depth 1 --branch "$tag" --filter=blob:none --sparse \
+              https://github.com/smileidentity/api-reference.git "$RUNNER_TEMP/api-reference-$tag"
+            git -C "$RUNNER_TEMP/api-reference-$tag" sparse-checkout set specs/v3
+            mkdir -p "$dir"
+            yq -o=json '.' "$RUNNER_TEMP/api-reference-$tag/specs/v3/openapi.yaml" > "$dir/openapi.json"
+          done
+
       - name: Check and publish the change
         env:
           UNIT: ${{ toJSON(matrix) }}
@@ -564,7 +585,7 @@ jobs:
           bot_id=$(gh api "/users/${BOT/\[bot\]/%5Bbot%5D}" --jq .id)
           python3 scripts/spec_sync/spec_sync.py publish --unit "$UNIT" --workdir "$workdir" --bundle "$bundle" \
             --out "$RUNNER_TEMP/result" --state-dir "$state" --bot-name "$BOT" \
-            --bot-email "$bot_id+$BOT@users.noreply.github.com" --run-url "$RUN_URL"
+            --bot-email "$bot_id+$BOT@users.noreply.github.com" --run-url "$RUN_URL" --spec-dir "$RUNNER_TEMP/spec"
 
       # Only this small file is uploaded: artifacts of a public repository are public.
       - name: Save the job result
