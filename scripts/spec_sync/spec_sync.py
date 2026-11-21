@@ -40,6 +40,7 @@ SDK_REPOS = [
 FIXTURES_REPO = "smileid-sdk-fixtures"
 ALL_REPOS = SDK_REPOS + [FIXTURES_REPO]
 ROLLING_BRANCH = "spec-sync/rolling"
+KINDS = ("rolling", "breaking", "scoped")
 LABEL = "spec-sync"
 BREAKING_LABEL = "breaking"
 STATUS_TITLE = "SDK spec sync status"
@@ -260,9 +261,10 @@ def mark_processed(state_dir, done, now, run_url):
     return moved
 
 
-# A job counts as done when it published a change, found none needed, or opened
-# a draft PR listing what Claude could not finish for a person to pick up.
-DONE_STATUSES = ("updated", "no_change", "blocked")
+# A job counts as done when it published a change, found none needed, closed a
+# PR that no longer changed anything, or opened a draft PR listing what Claude
+# could not finish for a person to pick up.
+DONE_STATUSES = ("updated", "no_change", "closed", "blocked")
 
 
 def synced_by_run(matrix, settled, job_results):
@@ -382,7 +384,60 @@ def map_units(units, api_tags):
     return kept, dropped
 
 
-def plan(pending, *, from_tag="", scope="", repos="", latest_api_tag=None, sync_due=True, api_tags=None):
+REFRESH_BRANCH = re.compile(r"^spec-sync/[A-Za-z0-9._-]{1,100}$")
+MAX_SCOPE = 200
+
+
+def refresh_problem(pr):
+    """Why the workflow can't refresh an open PR (see open_pr_info), or None if it can.
+
+    A refresh takes its branch and scope from the PR, not from the workflow or a
+    maintainer, and the scope goes into Claude's prompt and the PR title. So only
+    plain branch names and short, single-line scopes are accepted.
+    """
+    if not REFRESH_BRANCH.match(pr.get("branch", "")):
+        return "its branch name is not a plain spec-sync/<name>"
+    if pr.get("kind") not in KINDS:
+        return "its description does not say what kind of spec-sync PR it is"
+    if pr.get("kind") == "scoped":
+        scope = pr.get("scope", "")
+        if not scope:
+            return "it is a scoped PR with no recorded scope"
+        if len(scope) > MAX_SCOPE or not re.fullmatch(r"[^\r\n`<>$]+", scope):
+            return "its scope is longer than 200 characters or has line breaks or characters such as ` < > $"
+    return None
+
+
+def refresh_units(open_prs, latest_api_tag, planned_branches):
+    """Jobs that bring open spec-sync PRs up to the newest api-reference tag.
+
+    A spec change that lands while a PR is open must reach that PR, or the PR
+    merges code written against the old spec. The pending records can't show
+    this: a scoped PR's code isn't on the default branch, so the rolling job
+    finds nothing to change. Any open PR whose recorded spec tag is older than
+    the newest one gets a refresh job, unless this run already has a job for its
+    branch.
+    """
+    units = []
+    if not latest_api_tag:
+        return units
+    for pr in open_prs or []:
+        branch, spec_tag, kind = pr.get("branch", ""), pr.get("spec_tag", ""), pr.get("kind", "")
+        if branch in planned_branches or not is_behind(spec_tag, latest_api_tag):
+            continue
+        problem = refresh_problem(pr)
+        if problem:
+            print(f"::warning::{pr.get('url') or branch} is behind the spec but was not refreshed: {problem}. "
+                  "Refresh it by hand.")
+            continue
+        u = unit(kind, branch, spec_tag, latest_api_tag, [], pr.get("scope", "") if kind == "scoped" else "")
+        u["refresh"] = True
+        units.append(u)
+    return units
+
+
+def plan(pending, *, from_tag="", scope="", repos="", latest_api_tag=None, sync_due=True, api_tags=None,
+         open_prs=None):
     """Return the matrix of jobs to run and the records they consume.
 
     Each repository gets jobs only for the records it has not yet synced.
@@ -390,6 +445,9 @@ def plan(pending, *, from_tag="", scope="", repos="", latest_api_tag=None, sync_
     PR. A manual run with from_tag syncs everything from that tag to the newest
     api-reference tag. A manual run with scope makes one PR limited to that scope
     and leaves the pending records alone.
+
+    open_prs maps each repository to its open spec-sync PRs. Any of them that is
+    behind the newest api-reference tag gets a refresh job (see refresh_units).
 
     settled maps each repository to the tags it needs no job for: records at or
     before from_tag, and records that change nothing in the public spec. The
@@ -424,6 +482,7 @@ def plan(pending, *, from_tag="", scope="", repos="", latest_api_tag=None, sync_
             repo_units, unchanged = map_units(repo_units, api_tags)
             if already or unchanged:
                 settled[repo] = merge_tags(already, unchanged)
+            repo_units += refresh_units((open_prs or {}).get(repo), latest_api_tag, {u["branch"] for u in repo_units})
             for u in repo_units:
                 include.append({"repo": repo, **u})
                 if u not in units:
@@ -468,6 +527,16 @@ def write_marker(name, value):
     return f"<!-- {name} {text} -->"
 
 
+def section(body, heading):
+    """The text under a level-2 heading in a body, up to the next level-2 heading."""
+    match = re.search(r"^## " + re.escape(heading) + r"\n(.*?)(?=^## |\Z)", body or "", re.DOTALL | re.MULTILINE)
+    if not match:
+        return ""
+    text = match.group(1).strip()
+    # The footer follows the last section.
+    return re.sub(r"\n*Last updated by \[this run\]\(.*?\) on [^\n]*\.\s*$", "", text).strip()
+
+
 def merge_tags(*groups):
     return sorted({t for group in groups for t in group if TAG_RE.match(t)}, key=tag_key)
 
@@ -497,6 +566,9 @@ def checks_table(result):
 
 def render_pr_body(*, repo, u, tags, spec_tag, lambda_prs, records, summary, result, ready_ok, run_url, now):
     state = {"tags": tags, "spec_tag": spec_tag, "lambda_prs": lambda_prs, "ready_ok": ready_ok, "kind": u["kind"]}
+    if u["kind"] == "scoped":
+        # A later run refreshes this PR with the same scope.
+        state["scope"] = u["scope"]
     spec_link = f"https://github.com/{ORG}/api-reference/blob/{spec_tag}/specs/v3/openapi.yaml"
     intro = [
         write_marker(PR_MARKER, state),
@@ -786,6 +858,62 @@ def find_open_pr(repo, branch, token):
     return prs[0] if prs else None
 
 
+SCOPED_TITLE = re.compile(r"^Sync (.+) with the API spec at v\d+\.\d+\.\d+$")
+
+
+def open_pr_info(pr):
+    """What a refresh needs from an open spec-sync PR, read from its description's marker."""
+    marker = read_marker(pr.get("body"), PR_MARKER)
+    branch = pr.get("headRefName", "")
+    kind = marker.get("kind")
+    if not kind:
+        if branch == ROLLING_BRANCH:
+            kind = "rolling"
+        elif branch.startswith("spec-sync/breaking-"):
+            kind = "breaking"
+        else:
+            kind = "scoped"
+    scope = marker.get("scope", "")
+    if kind == "scoped" and not scope:
+        # PRs opened before the scope was recorded carry it only in their title.
+        match = SCOPED_TITLE.match(pr.get("title", ""))
+        scope = match.group(1) if match else ""
+    return {"number": pr.get("number"), "url": pr.get("url", ""), "branch": branch, "kind": kind,
+            "spec_tag": marker.get("spec_tag", ""), "scope": scope}
+
+
+def list_open_prs(repos, token):
+    """The open spec-sync PRs in each repository, for planning refreshes.
+
+    A repository that can't be read is left out with a warning, so its PRs are
+    only refreshed on a later run.
+    """
+    found = {}
+    for repo in repos:
+        try:
+            out = gh(["pr", "list", "--repo", f"{ORG}/{repo}", "--label", LABEL, "--state", "open",
+                      "--json", "number,url,title,body,headRefName,isCrossRepository", "--limit", "50"], token)
+        except SpecSyncError as e:
+            print(f"::warning::Could not list the spec-sync pull requests in {repo}, so none are refreshed: {e}")
+            continue
+        found[repo] = [open_pr_info(pr) for pr in json.loads(out or "[]")
+                       if not pr.get("isCrossRepository", True)
+                       and str(pr.get("headRefName", "")).startswith("spec-sync/")]
+    return found
+
+
+EMPTY_PR_COMMENT = (
+    "Closed by the spec-sync workflow: this branch no longer changes anything compared with the default branch, "
+    "so merging it would add nothing."
+)
+
+
+def close_empty_pr(repo, pr, token):
+    gh(["pr", "close", str(pr["number"]), "--repo", f"{ORG}/{repo}", "--comment", EMPTY_PR_COMMENT,
+        "--delete-branch"], token)
+    print(f"Closed {pr['url']}: it no longer changes anything")
+
+
 def lambda_pr_text(numbers, token):
     """Fetch lambda PR descriptions. They stay on the runner and are never published."""
     if not numbers:
@@ -873,6 +1001,35 @@ def prepare(*, u, repo, workdir, ctx, state_dir, template, token, read_token):
         "scoped": f"Limit the change to this part of the spec: {u['scope']}. Leave other differences alone. "
                   "Do not make breaking changes to the public API.",
     }
+    kind_note = kind_notes[u["kind"]]
+    if u.get("refresh"):
+        kind_note += (
+            f"\n\nThis run brings the open pull request up to date. It was written against the spec at "
+            f"`{u['base_tag']}`, and the spec has changed since. "
+        )
+        if u["kind"] == "rolling":
+            kind_note += "Make every change between the two spec tags, as for any rolling run."
+        else:
+            kind_note += (
+                "Compare the two spec tags and update the code this pull request adds or changes wherever the "
+                "spec change affects it: a changed type, field, enum, path or token product in an operation or "
+                "model this pull request covers. Leave spec changes outside this pull request alone; the rolling "
+                "spec-sync pull request handles them. If nothing this pull request covers changed, change nothing."
+            )
+    previous_summary = section(pr["body"], "What changed") if pr else ""
+    if previous_summary:
+        (ctx / "previous-summary.md").write_text(previous_summary + "\n")
+    existing_pr = "There is no open pull request yet."
+    if pr:
+        existing_pr = (
+            f"An open pull request already covers {', '.join(previous.get('tags', [])) or 'earlier changes'}; "
+            "keep its work and add to it."
+        )
+        if previous_summary:
+            existing_pr += (
+                f" Its current summary is in `{ctx}/previous-summary.md`. Your `summary.md` replaces it, so "
+                "describe the whole pull request, not only this run's change."
+            )
     values = {
         "repo": repo,
         "ctx": str(ctx),
@@ -881,9 +1038,8 @@ def prepare(*, u, repo, workdir, ctx, state_dir, template, token, read_token):
         "base_tag": u["base_tag"],
         "spec_tag": u["spec_tag"],
         "tags": ", ".join(u["tags"]) or "none",
-        "kind_note": kind_notes[u["kind"]],
-        "existing_pr": f"An open pull request already covers {', '.join(previous.get('tags', [])) or 'earlier changes'}; "
-                       "keep its work and add to it." if pr else "There is no open pull request yet.",
+        "kind_note": kind_note,
+        "existing_pr": existing_pr,
         "conflict_note": (
             f"Merging `{default}` into this branch left conflicts. Resolve every conflict marker first and "
             "`git add` the resolved files, but do not commit." if conflict else ""
@@ -958,6 +1114,8 @@ FIXTURES_NOTE = (
 
 
 SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+# The statuses Claude may report in result.json. "closed" is the workflow's own.
+CLAUDE_STATUSES = ("changed", "no_change", "blocked")
 
 
 def package(*, u, workdir, ctx, base, default_sha, dest):
@@ -1014,7 +1172,7 @@ def publish(*, u, workdir, bundle, out, state_dir, write_token, bot_name, bot_em
     if not SHA_RE.match(base) or not SHA_RE.match(default_sha):
         return finish("failed", "The sync job's bundle has no valid base commits, so nothing was pushed")
     result = read_json(bundle / "result.json")
-    if not isinstance(result, dict) or result.get("status") not in ("changed", "no_change", "blocked"):
+    if not isinstance(result, dict) or result.get("status") not in CLAUDE_STATUSES:
         return finish("failed", "Claude did not write a valid result.json, so nothing was pushed")
     summary_path = bundle / "summary.md"
     summary = summary_path.read_text() if summary_path.exists() else ""
@@ -1064,6 +1222,11 @@ def publish(*, u, workdir, bundle, out, state_dir, write_token, bot_name, bot_em
     if not changed_files and not pr:
         print(f"No changes are needed in {repo}.")
         return finish("no_change")
+    if not changed_files:
+        # Everything the PR changed is now on the default branch, for example
+        # because another PR made the same change. Merging it would add nothing.
+        close_empty_pr(repo, pr, write_token)
+        return finish("closed")
 
     code, _, _ = git(["diff", "--cached", "--quiet"], workdir, check=False)
     if code != 0 or merging:
@@ -1097,6 +1260,10 @@ def publish(*, u, workdir, bundle, out, state_dir, write_token, bot_name, bot_em
     ready_ok = result["status"] != "blocked" and not result.get("gaps")
     if result["status"] == "no_change" and not pr:
         ready_ok = False
+    if result["status"] == "no_change" and pr:
+        # Claude changed nothing (at most the default branch was merged in), so
+        # the PR's summary of its change still stands.
+        summary = section(pr["body"], "What changed") or summary
     body = render_pr_body(repo=repo, u=u, tags=tags, spec_tag=spec_tag, lambda_prs=lambda_prs, records=records,
                           summary=summary, result=result, ready_ok=ready_ok, run_url=run_url, now=now)
     body_file = out / "pr-body.md"
@@ -1154,15 +1321,25 @@ def checks_state(rollup):
     return state
 
 
-def promote_prs(repos, token):
-    """Mark green draft spec-sync PRs ready. Returns the open PRs per repo."""
+def is_behind(spec_tag, latest_api_tag):
+    return bool(TAG_RE.match(spec_tag or "") and latest_api_tag and tag_key(spec_tag) < tag_key(latest_api_tag))
+
+
+def promote_prs(repos, token, latest_api_tag=None):
+    """Mark green draft spec-sync PRs ready. Returns the open PRs per repo.
+
+    A PR written against an older spec than latest_api_tag goes back to draft,
+    so it can't be merged with code the newer spec changed, until the next sync
+    refreshes it. A PR that no longer changes anything is closed.
+    """
     found = {}
     for repo in repos:
         # One repository that can't be read must not stop the others or the status issue.
         try:
             out = gh(
                 ["pr", "list", "--repo", f"{ORG}/{repo}", "--label", LABEL, "--state", "open",
-                 "--json", "number,url,isDraft,body,headRefName,statusCheckRollup,isCrossRepository", "--limit", "50"],
+                 "--json", "number,url,title,isDraft,body,headRefName,statusCheckRollup,isCrossRepository,changedFiles",
+                 "--limit", "50"],
                 token,
             )
         except SpecSyncError as e:
@@ -1173,10 +1350,34 @@ def promote_prs(repos, token):
         for pr in json.loads(out or "[]"):
             if pr.get("isCrossRepository", True):
                 continue
+            if pr.get("changedFiles") == 0 and str(pr.get("headRefName", "")).startswith("spec-sync/"):
+                try:
+                    close_empty_pr(repo, pr, token)
+                except SpecSyncError as e:
+                    print(f"::warning::Could not close {pr['url']}, which no longer changes anything: {e}")
+                else:
+                    continue
             marker = read_marker(pr.get("body"), PR_MARKER)
             checks = checks_state(pr.get("statusCheckRollup"))
             draft = pr.get("isDraft", False)
-            if draft and checks == "success" and marker.get("ready_ok"):
+            behind = is_behind(marker.get("spec_tag"), latest_api_tag)
+            # A PR the workflow can't refresh is still held back, so it isn't merged with
+            # code the newer spec changed, but it needs a person to refresh it.
+            problem = refresh_problem(open_pr_info(pr)) if behind else None
+            if problem:
+                print(f"::warning::{pr['url']} is behind the spec and can't be refreshed automatically: {problem}. "
+                      "Refresh it by hand.")
+            if behind and not draft:
+                try:
+                    gh(["pr", "ready", str(pr["number"]), "--repo", f"{ORG}/{repo}", "--undo"], token)
+                except SpecSyncError as e:
+                    print(f"::warning::Could not move {pr['url']} back to draft: {e}")
+                else:
+                    print(f"Moved {pr['url']} back to draft: it was written against {marker.get('spec_tag')}, "
+                          f"and the spec is now at {latest_api_tag}."
+                          + (" It needs refreshing by hand." if problem else " The next sync refreshes it."))
+                    draft = True
+            if draft and not behind and checks == "success" and marker.get("ready_ok"):
                 # One PR that can't be marked ready must not stop the others or the status issue.
                 try:
                     gh(["pr", "ready", str(pr["number"]), "--repo", f"{ORG}/{repo}"], token)
@@ -1186,7 +1387,8 @@ def promote_prs(repos, token):
                     print(f"Marked {pr['url']} ready for review")
                     draft = False
             prs.append({"number": pr["number"], "url": pr["url"], "draft": draft, "checks": checks,
-                        "branch": pr.get("headRefName", ""), "spec_tag": marker.get("spec_tag", "")})
+                        "branch": pr.get("headRefName", ""), "spec_tag": marker.get("spec_tag", ""),
+                        "behind": behind, "refresh_problem": problem})
         found[repo] = sorted(prs, key=lambda p: p["number"])
     return found
 
@@ -1207,6 +1409,8 @@ def update_last_runs(previous, job_results, planned_repos, run_url, now, sync_re
             status = "blocked"
         elif "updated" in statuses:
             status = "updated"
+        elif "closed" in statuses:
+            status = "closed an empty PR"
         else:
             status = "no change"
         runs[repo] = {"result": status, "run_url": run_url, "at": now}
@@ -1246,7 +1450,12 @@ def render_status_issue(*, prs, runs, pending, last_processed, run_url, now, syn
             state_text = "draft" if pr["draft"] else "ready"
             checks = {"success": "checks green", "pending": "checks running", "failure": "checks failing",
                       "none": "no checks yet"}[pr["checks"]]
-            cells.append(f"[#{pr['number']}]({pr['url']}) {state_text}, {checks}")
+            cell = f"[#{pr['number']}]({pr['url']}) {state_text}, {checks}"
+            if pr.get("behind"):
+                cell += f", behind the spec (written against `{pr['spec_tag']}`), " + (
+                    "can't be refreshed automatically: refresh it by hand" if pr.get("refresh_problem")
+                    else "waiting for the next sync")
+            cells.append(cell)
         rolling = next((p for p in repo_prs if p["branch"] == ROLLING_BRANCH), None)
         spec_tag = (rolling or {}).get("spec_tag") or last_processed or ""
         run = runs.get(repo)
@@ -1357,6 +1566,7 @@ def main(argv=None):
     p.add_argument("--sync-result", default="skipped")
     p.add_argument("--run-url", required=True)
     p.add_argument("--body-file", required=True)
+    p.add_argument("--api-tags-file", default="", help="api-reference tags; PRs behind the newest go back to draft")
 
     args = parser.parse_args(argv)
     try:
@@ -1365,19 +1575,29 @@ def main(argv=None):
             record_dispatch(event, args.state_dir, args.run_url, now_utc())
         elif args.command == "plan":
             api_tags = Path(args.api_tags_file).read_text().split() if args.api_tags_file else []
+            open_prs = None
+            sync_due = args.sync_due == "true"
+            # OPEN_PRS_TOKEN reads the SDK repositories' PRs. Without it, open PRs aren't refreshed.
+            if sync_due and not args.scope.strip():
+                token = os.environ.get("OPEN_PRS_TOKEN", "")
+                if token:
+                    open_prs = list_open_prs(select_repos(args.repos), token)
+                else:
+                    print("::warning::No token could read the SDK repositories, so open spec-sync PRs that are "
+                          "behind the spec are not refreshed in this run.")
             result = plan(load_records(args.state_dir, "pending"), from_tag=args.from_tag.strip(),
                           scope=args.scope.strip(), repos=args.repos, latest_api_tag=latest_tag(api_tags),
-                          sync_due=args.sync_due == "true",
-                          api_tags=api_tags if args.api_tags_file else None)
+                          sync_due=sync_due, api_tags=api_tags if args.api_tags_file else None,
+                          open_prs=open_prs)
             for key in ("has_work", "mark_processed"):
                 write_output(key, str(result[key]).lower())
             write_output("tags", result["tags"])
             write_output("settled", result["settled"])
             write_output("matrix", result["matrix"])
             write_output("repos", sorted({i["repo"] for i in result["matrix"]["include"]}))
-            print(result.get("reason") or f"Planned {len(result['matrix']['include'])} jobs for "
-                  f"{len(result['units'])} pull request(s) per repository: "
-                  + "; ".join(f"{u['branch']} {u['base_tag']}..{u['spec_tag']}" for u in result["units"]))
+            print(result.get("reason") or f"Planned {len(result['matrix']['include'])} jobs: "
+                  + "; ".join(f"{i['repo']} {i['branch']} {i['base_tag']}..{i['spec_tag']}"
+                              + (" (refresh)" if i.get("refresh") else "") for i in result["matrix"]["include"]))
         elif args.command == "prepare":
             u = json.loads(args.unit)
             state = prepare(u=u, repo=u["repo"], workdir=args.workdir, ctx=args.ctx, state_dir=args.state_dir,
@@ -1410,7 +1630,8 @@ def main(argv=None):
             token = os.environ["APP_TOKEN"]
             issue_token = os.environ["ISSUE_TOKEN"]
             repo_full = os.environ.get("GITHUB_REPOSITORY", f"{ORG}/central-workflows")
-            prs = promote_prs(ALL_REPOS, token)
+            api_tags = Path(args.api_tags_file).read_text().split() if args.api_tags_file else []
+            prs = promote_prs(ALL_REPOS, token, latest_tag(api_tags))
             results = [read_json(p, {}) for p in sorted(Path(args.results_dir).glob("**/job-result.json"))]
             issue = find_status_issue(repo_full, issue_token)
             previous = read_marker(issue["body"], ISSUE_MARKER).get("runs", {}) if issue else {}
