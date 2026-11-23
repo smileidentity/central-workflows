@@ -65,5 +65,16 @@ class KeepaliveTest(unittest.TestCase):
         self.assertEqual(sorted(listed.split()), scheduled)
 
 
+class SpecCoverageActionTest(unittest.TestCase):
+    """The action finds the checker by a relative path, so a move of either file must update both."""
+
+    def test_the_action_runs_the_checker(self):
+        action = WORKFLOWS.parent / "actions" / "spec-coverage"
+        text = (action / "action.yml").read_text()
+        (relative,) = re.findall(r"SCRIPT: \$\{\{ github\.action_path \}\}/(\S+)", text)
+        self.assertTrue((action / relative).resolve().is_file(), relative)
+        self.assertIn('python3 "$SCRIPT" --manifest "$MANIFEST"', text)
+
+
 if __name__ == "__main__":
     unittest.main()
