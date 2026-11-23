@@ -1,0 +1,37 @@
+name: SDK spec coverage
+description: >-
+  Check an SDK's spec-coverage.json against the whole public API spec at the
+  api-reference tag the file names. Fails if the spec has an operation or
+  response header the file doesn't account for, or the file names one the spec
+  doesn't have.
+
+inputs:
+  manifest:
+    description: Path to the coverage file, relative to the repository root.
+    default: spec-coverage.json
+
+runs:
+  using: composite
+  steps:
+    - name: Check spec coverage
+      shell: bash
+      env:
+        MANIFEST: ${{ inputs.manifest }}
+        # Actions are downloaded whole, so the script is beside this file.
+        SCRIPT: ${{ github.action_path }}/../../../scripts/spec_sync/spec_coverage.py
+      run: |
+        set -euo pipefail
+        if [ ! -f "$MANIFEST" ]; then
+          echo "::error::$MANIFEST not found. Every SDK keeps one; see AGENTS.md."
+          exit 1
+        fi
+        tag="$(jq -r '.spec_tag // empty' "$MANIFEST")"
+        if ! [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+          echo "::error file=$MANIFEST::spec_tag must be an api-reference release tag, such as v3.1215.0."
+          exit 1
+        fi
+        spec="$RUNNER_TEMP/spec-coverage-openapi"
+        curl -fsSL --retry 3 -o "$spec.yaml" \
+          "https://raw.githubusercontent.com/smileidentity/api-reference/$tag/specs/v3/openapi.yaml"
+        yq -o=json '.' "$spec.yaml" > "$spec.json"
+        python3 "$SCRIPT" --manifest "$MANIFEST" --spec "$spec.json" | tee -a "$GITHUB_STEP_SUMMARY"

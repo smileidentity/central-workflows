@@ -1084,6 +1084,81 @@ class PrepareAndPublishTest(unittest.TestCase):
         self.publish(fake)
         self.assertIn("named no file this pull request changes: `schema AmlPersonMatch.addresses`", fake.body)
 
+    def commit_manifest(self, operations, spec_tag="v3.11.0"):
+        """Put a spec-coverage.json on main, as an SDK that has adopted the coverage check has."""
+        (self.work / "spec-coverage.json").write_text(json.dumps({"spec_tag": spec_tag, "operations": operations}))
+        sh(["git", "add", "-A"], self.work)
+        sh(["git", "-c", "user.name=t", "-c", "user.email=t@example.com", "commit", "-qm", "coverage"], self.work)
+        sh(["git", "push", "-q", "origin", "main"], self.work)
+
+    def test_coverage_gaps_are_listed_for_claude_and_checked_on_publish(self):
+        # The SDK's file predates the AML operation, which was in the spec before syncing started.
+        self.commit_manifest({})
+        fake = FakeGitHub()
+        self.prepare(fake)
+        task = (self.ctx / "TASK.md").read_text()
+        self.assertIn("`spec-coverage.json` maps every public operation", task)
+        self.assertIn(f"set `spec_tag` to `v3.12.0`", task)
+        self.assertIn(f"python3 {self.ctx}/spec_coverage.py --spec {self.ctx}/spec/v3.12.0/openapi.json "
+                      "--spec-tag v3.12.0", task)
+        self.assertTrue((self.ctx / "spec_coverage.py").is_file())
+        gaps = (self.ctx / "coverage-gaps.md").read_text()
+        self.assertIn("- spec-coverage.json is for the spec at `v3.11.0`, not `v3.12.0`.", gaps)
+        self.assertIn("- `oneTimeAml` (POST /v3/aml) is in the spec but not in spec-coverage.json.", gaps)
+
+        # Claude adds the operation but leaves the file alone.
+        self.claude()
+        self.publish(fake)
+        self.assertFalse(s.read_marker(fake.body, s.PR_MARKER)["ready_ok"])
+        self.assertIn("`spec-coverage.json` doesn't match the spec at `v3.12.0`: spec-coverage.json is for the spec "
+                      "at `v3.11.0`", fake.body)
+        self.assertIn("`oneTimeAml` (POST /v3/aml) is in the spec but not in spec-coverage.json", fake.body)
+
+    def test_an_updated_coverage_file_lets_the_pr_go_ready(self):
+        self.commit_manifest({})
+        fake = FakeGitHub()
+        self.prepare(fake)
+        manifest = {"spec_tag": "v3.12.0", "operations": {
+            "oneTimeAml": {"method": "aml.screen", "path": "POST /v3/aml", "response_headers": {}}}}
+        self.claude(files={"aml.go": "package smileid\n", "spec-coverage.json": json.dumps(manifest)})
+        self.publish(fake)
+        self.assertTrue(s.read_marker(fake.body, s.PR_MARKER)["ready_ok"])
+        self.assertNotIn("## Gaps", fake.body)
+
+    def test_coverage_is_not_checked_without_the_file_or_on_scoped_runs(self):
+        fake = FakeGitHub()
+        self.prepare(fake)
+        self.assertNotIn("spec-coverage.json", (self.ctx / "TASK.md").read_text())
+        self.assertFalse((self.ctx / "coverage-gaps.md").exists())
+
+        self.commit_manifest({})
+        self.unit = {**self.unit, "kind": "scoped", "branch": "spec-sync/aml", "scope": "AML operations"}
+        self.prepare(fake)
+        self.assertNotIn("spec-coverage.json", (self.ctx / "TASK.md").read_text())
+        self.claude()
+        self.publish(fake)
+        self.assertTrue(s.read_marker(fake.body, s.PR_MARKER)["ready_ok"])
+
+    def test_coverage_without_the_new_spec(self):
+        self.commit_manifest({})
+        for root in (self.spec_dir, self.ctx / "spec"):
+            (root / "v3.12.0" / "openapi.json").unlink()
+        fake = FakeGitHub()
+        self.prepare(fake)
+        self.assertNotIn("spec-coverage.json` maps", (self.ctx / "TASK.md").read_text())
+        self.claude()
+        self.publish(fake)
+        self.assertIn("could not read the spec at `v3.12.0`, so it could not check `spec-coverage.json`", fake.body)
+
+    def test_a_coverage_file_that_is_not_json(self):
+        self.commit_manifest({})
+        fake = FakeGitHub()
+        self.prepare(fake)
+        self.claude(files={"spec-coverage.json": "{"})
+        self.publish(fake)
+        self.assertIn("`spec-coverage.json` doesn't match the spec at `v3.12.0`: spec-coverage.json is not valid JSON.",
+                      fake.body)
+
     def test_spec_changes_without_the_specs(self):
         for root in (self.spec_dir, self.ctx / "spec"):
             for path in root.glob("*/openapi.json"):

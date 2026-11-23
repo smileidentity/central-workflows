@@ -132,6 +132,34 @@ The `spec-sync` and `breaking` labels must exist in every target repository, inc
 
 Merge order: smileid-sdk-rust#2 and #3, and smileid-sdk-fixtures#1, before the Bedrock variables are set. Merge this workflow before lambda#5217, or lambda's dispatches are lost until a `from_tag` run.
 
+## Check that each SDK covers the whole spec
+
+spec-sync only sees the changes between two spec tags. An operation that was already in the spec when an SDK started syncing never shows up in a diff, so nothing noticed that Enhanced KYC sync, address, phone and Smile Links were missing from every SDK.
+
+Each SDK keeps a `spec-coverage.json` at its root. It maps every public operation in the spec, by operationId, to the SDK method that calls it, and every response header the operation returns to the result or error field a caller reads it from. Anything the SDK doesn't do is marked `unsupported` with a reason, so a gap is a decision someone can see in review, not an accident:
+
+```json
+{
+  "spec_tag": "v3.1215.0",
+  "operations": {
+    "submitBasicKycSync": {
+      "method": "basic_kyc.verify_sync",
+      "path": "POST /v3/basic_kyc/sync",
+      "response_headers": {
+        "SmileID-Job-ID": "BasicKycResult.job_id, SmileIDError.job_id",
+        "Response-Signature": {"unsupported": "The SDK doesn't verify response signatures."}
+      }
+    },
+    "createSmileLink": {"unsupported": "Planned for 13.3.0."}
+  }
+}
+```
+
+`scripts/spec_sync/spec_coverage.py` compares the file with the public spec at its `spec_tag`, leaving out anything marked `x-internal` or `x-smile-sdk-exclude`. It fails when the spec has an operation or response header the file doesn't account for, when the file names one the spec doesn't have, or when a `path` doesn't match the spec. Each SDK's own tests check the other direction: that every `method` exists and every supported operation is in the SDK's operation table, so the file can't claim support the SDK doesn't have.
+
+- In the SDKs, the `spec-coverage` action runs the check on every pull request: `uses: smileidentity/central-workflows/.github/actions/spec-coverage@<commit SHA>`. It downloads the spec at the file's `spec_tag` from api-reference, which is public, so it needs no token.
+- In spec-sync, rolling and breaking runs give Claude the check's findings against the new spec tag, including gaps that were there before the run. Claude must bring the file up to the new tag. The publish job runs the check again on the result, and any problem keeps the PR a draft. Scoped runs cover part of the spec only, so they skip it. An SDK without the file is skipped.
+
 ## Keep the SDK fixtures in step with sandbox
 
 The SDKs' integration cases in `smileid-sdk-fixtures` are generated from lambda's sandbox test identities (`packages/shared/v3/testIdentities.ts`), so they can't drift from what sandbox returns.

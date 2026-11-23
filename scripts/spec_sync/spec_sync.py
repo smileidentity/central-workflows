@@ -11,6 +11,9 @@ Subcommands:
                 to state/processed once every repository has
   status          mark green spec-sync PRs ready and rewrite the status issue
 
+spec_coverage.py, beside this file, checks an SDK's spec-coverage.json against
+the whole spec. prepare lists what it finds for Claude, and publish checks it again.
+
 Each subcommand is a thin wrapper around functions that tests call directly.
 Every call to git or gh goes through run(), so tests can replace it.
 """
@@ -26,6 +29,8 @@ import re
 import subprocess
 import sys
 from pathlib import Path
+
+import spec_coverage
 
 ORG = "smileidentity"
 SDK_REPOS = [
@@ -1046,6 +1051,7 @@ def prepare(*, u, repo, workdir, ctx, state_dir, template, token, read_token):
         ),
         "repo_note": FIXTURES_NOTE if repo == FIXTURES_REPO else SDK_NOTE.format(ctx=ctx),
         "spec_changes_note": spec_changes_note(u, ctx, repo),
+        "coverage_note": coverage_note(u, ctx, repo, workdir),
     }
     (ctx / "TASK.md").write_text(render_task(template, values))
     return {"repo": repo, "default": default, "base": base, "default_sha": default_sha, "pr": pr,
@@ -1084,6 +1090,49 @@ def spec_changes_note(u, ctx, repo):
         "request changes. A missing or unproven entry keeps the pull request a draft."
     )
 
+
+
+def checks_coverage(u, repo, workdir):
+    """Rolling and breaking runs bring the SDK up to the whole spec, so they must keep spec-coverage.json in step.
+
+    A scoped run covers only part of the spec, and an SDK without the file has not adopted the check yet.
+    """
+    return repo in SDK_REPOS and u["kind"] != "scoped" and (Path(workdir) / spec_coverage.MANIFEST).is_file()
+
+
+def coverage_problems(u, workdir, spec):
+    manifest = read_json(Path(workdir) / spec_coverage.MANIFEST)
+    if manifest is None:
+        return [f"{spec_coverage.MANIFEST} is not valid JSON."]
+    return spec_coverage.check(manifest, spec, u["spec_tag"])
+
+
+def coverage_note(u, ctx, repo, workdir):
+    """Tell Claude what spec-coverage.json is and what it is missing against the new spec."""
+    if not checks_coverage(u, repo, workdir):
+        return ""
+    spec = load_spec(Path(ctx) / "spec", u["spec_tag"])
+    if spec is None:
+        return ""
+    problems = coverage_problems(u, workdir, spec)
+    path = Path(ctx) / "coverage-gaps.md"
+    path.write_text("".join(f"- {p}\n" for p in problems) or "None.\n")
+    script = Path(ctx) / "spec_coverage.py"
+    script.write_text(Path(spec_coverage.__file__).read_text())
+    return (
+        f"`{spec_coverage.MANIFEST}` maps every public operation in the spec, and every response header it "
+        "returns, to the SDK method or field that exposes it, or marks it unsupported with a reason. It covers the "
+        "whole spec, not only what changed, so it also lists operations that were in the spec before syncing "
+        f"started. Bring it up to `{u['spec_tag']}`: set `spec_tag` to `{u['spec_tag']}`, and add or change "
+        "entries for every operation and header you add or change. "
+        f"`{path}` lists what the file is missing against `{u['spec_tag']}` right now. For each, implement it "
+        "with tests if it is part of this change. Otherwise leave the existing `unsupported` entry alone, or, for "
+        "something new you can't implement here, add one with the reason and list it under gaps. Never mark "
+        "something unsupported that the SDK already does. The publish job runs the same check, and any "
+        "problem left keeps the pull request a draft. Run it yourself before you finish: "
+        f"`python3 {script} --spec {Path(ctx) / 'spec' / u['spec_tag'] / 'openapi.json'} --spec-tag {u['spec_tag']}`, "
+        "from the repository root."
+    )
 
 SDK_NOTE = (
     "The integration cases live in the private `smileid-sdk-fixtures` repository, as "
@@ -1255,6 +1304,17 @@ def publish(*, u, workdir, bundle, out, state_dir, write_token, bot_name, bot_em
                      "could not check that every spec change was handled."]
         else:
             extra = spec_change_gaps(spec_changes(old, new), result.get("spec_changes"), changed_files)
+        if checks_coverage(u, repo, workdir):
+            if new is None:
+                extra.append(f"The publish job could not read the spec at `{u['spec_tag']}`, so it could not check "
+                             f"`{spec_coverage.MANIFEST}`.")
+            else:
+                problems = coverage_problems(u, workdir, new)
+                if problems:
+                    shown = " ".join(problems[:MAX_LISTED_GAPS])
+                    more = len(problems) - MAX_LISTED_GAPS
+                    extra.append(f"`{spec_coverage.MANIFEST}` doesn't match the spec at `{u['spec_tag']}`: {shown}"
+                                 + (f" And {more} more." if more > 0 else ""))
         if extra:
             result = {**result, "gaps": [*(result.get("gaps") or []), *extra]}
     ready_ok = result["status"] != "blocked" and not result.get("gaps")
