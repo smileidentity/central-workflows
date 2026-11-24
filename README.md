@@ -109,6 +109,8 @@ A compromised Claude step can propose a bad change, and the same checks and a pe
 
 To clear a backlog, run `SDK spec sync` by hand with `from_tag` set to the spec tag the SDKs already match. Add `scope`, such as `AML operations`, to open a separate `spec-sync/<scope>` PR for one part of the spec. Use `repos`, such as `go`, to run only some repositories. The release is marked processed for those that succeed, and stays pending for the rest.
 
+To add what the SDKs are missing, run it by hand with `backfill` ticked. See [Backfill what an SDK is missing](#backfill-what-an-sdk-is-missing).
+
 Daily and manual syncs share one concurrency group, because two syncs at once would push to the same spec-sync branches. GitHub keeps only one waiting run in a group, so if you start a second manual run while another is still waiting, GitHub cancels the waiting one. The plan job adds a notice for any run that was cancelled before it started in the last day. Run it again if it is still needed. To avoid this, wait for a manual run to start before starting another.
 
 GitHub turns off scheduled workflows in a public repository after 60 days with no activity. Each scheduled run of `sdk-spec-sync.yml` enables `sdk-spec-sync.yml`, `sdk-fixtures-personas.yml` and `pr-hygiene.yml` through the API, which restarts that count. It leaves alone a workflow that a person turned off. It only writes to the run's log. `tests/test_workflows.py` checks that every scheduled workflow is in its list.
@@ -159,6 +161,19 @@ Each SDK keeps a `spec-coverage.json` at its root. It maps every public operatio
 
 - In the SDKs, the `spec-coverage` action runs the check on every pull request: `uses: smileidentity/central-workflows/.github/actions/spec-coverage@<commit SHA>`. It downloads the spec at the file's `spec_tag` from api-reference, which is public, so it needs no token.
 - In spec-sync, rolling and breaking runs give Claude the check's findings against the new spec tag, including gaps that were there before the run. Claude must bring the file up to the new tag. The publish job runs the check again on the result, and any problem keeps the PR a draft. Scoped runs cover part of the spec only, so they skip it. An SDK without the file is skipped.
+
+To say something should never be added, add `"backfill": false` to its `unsupported` entry, for an operation or a header: `{"unsupported": "The body has the same values.", "backfill": false}`. Backfill runs leave it alone. An SDK needs the action pinned to a commit that has this change before its file can use it.
+
+### Backfill what an SDK is missing
+
+Run `SDK spec sync` by hand with `backfill` ticked to have Claude add everything the SDKs' `spec-coverage.json` files leave out or mark unsupported. Use `repos` to limit it. It can't be combined with `from_tag` or `scope`, and it leaves pending lambda releases for the daily run.
+
+- The plan job reads every SDK's file from its default branch, and the spec at each file's `spec_tag`. Its run summary has a parity table: each operation or header that at least one SDK doesn't support, and which SDKs do.
+- Each SDK with something missing gets one PR, `spec-sync/backfill`, against the spec tag its file names. A second backfill run adds to that PR. One PR per SDK keeps reviews from tripping over each other: two PRs that both change `spec-coverage.json` would mean whichever merged second needed a new commit, which dismisses its approvals.
+- For the same reason, an SDK with any other spec-sync PR open is skipped with a warning. Merge or close that PR first. An SDK whose open PRs can't be listed is skipped too.
+- Claude gets the list, with how the other SDKs expose each item as a guide to naming. It works like any other spec-sync job: no write token, and the publish job checks and pushes the change. The publish job runs the coverage check, and lists as a gap anything still unsupported, an added operation whose headers are still unsupported, and anything Claude marked `"backfill": false`. Only a maintainer decides that.
+- A backfill PR that falls behind the newest spec is refreshed like a scoped PR. The refresh leaves `spec-coverage.json` to the rolling PR.
+- The PR opens as a draft and the hourly status job marks it ready once its checks pass, so a maintainer reviews and approves it like any other.
 
 ## Keep the SDK fixtures in step with sandbox
 

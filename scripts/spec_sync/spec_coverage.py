@@ -9,6 +9,9 @@ method or value that exposes it, or marks it unsupported with a reason. The
 check fails when the spec has something the file doesn't account for, or the
 file names something the spec doesn't have.
 
+An unsupported entry may add "backfill": false to say it should never be
+added. spec-sync's backfill runs add everything else that is unsupported.
+
 Usage:
   spec_coverage.py --manifest spec-coverage.json --spec openapi.json [--spec-tag v3.1215.0]
 
@@ -57,8 +60,15 @@ def spec_operations(spec):
 
 
 def _reason(value):
-    return isinstance(value, dict) and set(value) == {"unsupported"} and isinstance(value["unsupported"], str) \
-        and bool(value["unsupported"].strip())
+    """An unsupported entry: {"unsupported": "<reason>"}, optionally with "backfill": false."""
+    return (isinstance(value, dict) and set(value) <= {"unsupported", "backfill"}
+            and isinstance(value.get("unsupported"), str) and bool(value["unsupported"].strip())
+            and value.get("backfill", False) is False)
+
+
+def _excluded(value):
+    """Unsupported on purpose: a maintainer marked it "backfill": false, so backfill runs leave it alone."""
+    return _reason(value) and "backfill" in value
 
 
 def check(manifest, spec, spec_tag=None):
@@ -90,7 +100,7 @@ def check(manifest, spec, spec_tag=None):
             continue
         if not isinstance(entry, dict) or "unsupported" in entry:
             problems.append(f"`{op_id}`: give either `method` with `path` and `response_headers`, or only "
-                            "`unsupported` with a reason.")
+                            "`unsupported` with a reason, plus `\"backfill\": false` if it should never be added.")
             continue
         if not isinstance(entry.get("method"), str) or not entry["method"].strip():
             problems.append(f"`{op_id}`: `method` must name the SDK method that calls it.")
@@ -115,6 +125,57 @@ def check(manifest, spec, spec_tag=None):
             if name.lower() not in spec_headers:
                 problems.append(f"`{op_id}`: the spec doesn't return a `{name}` header. Remove it.")
     return problems
+
+
+def _entries(manifest):
+    entries = manifest.get("operations") if isinstance(manifest, dict) else None
+    return entries if isinstance(entries, dict) else {}
+
+
+def entry_for(manifest, operation, header=None):
+    """The manifest's value for an operation, or for one of its response headers (matched without case)."""
+    entry = _entries(manifest).get(operation)
+    if header is None or not isinstance(entry, dict) or _reason(entry):
+        return entry if header is None else None
+    headers = entry.get("response_headers")
+    if not isinstance(headers, dict):
+        return None
+    listed = {name.lower(): value for name, value in headers.items()}
+    return listed.get(header.lower())
+
+
+def supported_as(manifest, operation, header=None):
+    """How the SDK exposes an operation (its method) or a header (its field), or None if it doesn't."""
+    value = entry_for(manifest, operation, header)
+    if header is None:
+        value = value.get("method") if isinstance(value, dict) and not _reason(value) else None
+    return value.strip() if isinstance(value, str) and value.strip() else None
+
+
+def backfill_targets(manifest, spec):
+    """What a backfill run should add to an SDK.
+
+    Every public operation and response header in the spec that the manifest
+    leaves out or marks unsupported, except those a maintainer marked
+    "backfill": false. Headers of an unsupported operation come with it, so
+    they aren't listed on their own.
+    """
+    targets = []
+    for op_id, op in sorted(spec_operations(spec).items()):
+        entry = entry_for(manifest, op_id)
+        if entry is None or _reason(entry):
+            if not _excluded(entry):
+                why = "not in spec-coverage.json" if entry is None else f"unsupported: {entry['unsupported']}"
+                targets.append({"id": f"operation {op_id}", "operation": op_id, "path": op["path"], "status": why})
+            continue
+        for name in op["headers"]:
+            value = entry_for(manifest, op_id, name)
+            if (value is not None and not _reason(value)) or _excluded(value):
+                continue
+            why = "not in spec-coverage.json" if value is None else f"unsupported: {value['unsupported']}"
+            targets.append({"id": f"header {op_id} {name}", "operation": op_id, "header": name, "path": op["path"],
+                            "status": why})
+    return targets
 
 
 def summary(manifest):

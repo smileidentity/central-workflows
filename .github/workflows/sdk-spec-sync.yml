@@ -8,6 +8,11 @@ name: SDK spec sync
 # in place, never commented on. Each daily run also refreshes any open
 # spec-sync PR written against an older spec than the newest api-reference tag.
 #
+# A manual run with backfill ticked syncs no spec change. Instead, each SDK gets
+# one PR (spec-sync/backfill) adding every operation and response header its
+# spec-coverage.json leaves out or marks unsupported, and the run summary shows
+# which SDKs support what.
+#
 # Every hour, the status job marks draft spec-sync PRs ready once all their
 # checks pass, moves PRs that are behind the newest spec back to draft until
 # they are refreshed, closes PRs that no longer change anything, and rewrites
@@ -36,6 +41,10 @@ on:
         description: Optional comma-separated repositories, such as "go,python" or "fixtures". Default is all. Each repository that syncs is marked done for the pending releases it covered.
         type: string
         default: ''
+      backfill:
+        description: Add what each SDK is missing instead of syncing spec changes. Opens one spec-sync/backfill PR per SDK for everything its spec-coverage.json leaves out or marks unsupported, and reports parity across the SDKs. Skips an SDK with another spec-sync PR open. Can't be combined with from_tag or scope.
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -105,7 +114,8 @@ jobs:
           persist-credentials: false
 
       # Read-only, to find open spec-sync PRs that are behind the spec so this run
-      # refreshes them. Without it the plan carries on and refreshes none.
+      # refreshes them, and for a backfill run to read each SDK's spec-coverage.json.
+      # Without it the plan carries on and refreshes none; a backfill run stops.
       - id: open-prs-token
         if: steps.secrets.outputs.configured == 'true' && (github.event_name != 'schedule' || github.event.schedule == env.SYNC_CRON)
         continue-on-error: true
@@ -115,6 +125,7 @@ jobs:
           private-key: ${{ secrets.SPEC_SYNC_READER_PRIVATE_KEY }}
           owner: smileidentity
           repositories: smileid-sdk-go,smileid-sdk-java,smileid-sdk-js,smileid-sdk-php,smileid-sdk-python,smileid-sdk-ruby,smileid-sdk-rust,smileid-sdk-fixtures
+          permission-contents: read
           permission-pull-requests: read
           # Don't revoke the token: it expires after an hour.
           skip-token-revoke: true
@@ -126,6 +137,7 @@ jobs:
           FROM_TAG: ${{ inputs.from_tag }}
           SCOPE: ${{ inputs.scope }}
           REPOS: ${{ inputs.repos }}
+          BACKFILL: ${{ inputs.backfill }}
           SYNC_DUE: ${{ github.event_name != 'schedule' || github.event.schedule == env.SYNC_CRON }}
           OPEN_PRS_TOKEN: ${{ steps.open-prs-token.outputs.token }}
         run: |
@@ -144,7 +156,7 @@ jobs:
             exit 1
           fi
           python3 scripts/spec_sync/spec_sync.py plan --state-dir "$state" --api-tags-file "$tags" \
-            --from-tag "$FROM_TAG" --scope "$SCOPE" --repos "$REPOS" --sync-due "$SYNC_DUE"
+            --from-tag "$FROM_TAG" --scope "$SCOPE" --repos "$REPOS" --sync-due "$SYNC_DUE" --backfill "$BACKFILL"
 
       # A run cancelled before any job started was most likely replaced while it
       # waited in the concurrency group. Say so, so a lost manual run is noticed.
