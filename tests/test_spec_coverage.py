@@ -141,11 +141,55 @@ class CheckTest(unittest.TestCase):
         for tag in (None, "main", "3.1.0"):
             self.assertIn("needs a `spec_tag`", c.check(manifest(spec_tag=tag), SPEC)[0])
 
+    def test_unsupported_entries_may_opt_out_of_backfill(self):
+        m = manifest()
+        m["operations"]["v3PhoneVerification"]["backfill"] = False
+        m["operations"]["submitBasicKycSync"]["response_headers"]["Response-Signature"]["backfill"] = False
+        self.assertEqual(c.check(m, SPEC), [])
+        for value in (True, "false", None):
+            m["operations"]["v3PhoneVerification"]["backfill"] = value
+            (problem,) = c.check(m, SPEC)
+            self.assertIn("plus `\"backfill\": false` if it should never be added", problem)
+
     def test_shape(self):
         self.assertEqual(c.check([], SPEC), ["spec-coverage.json must be a JSON object."])
         self.assertEqual(c.check(manifest(operations=[]), SPEC),
                          ["spec-coverage.json needs an `operations` object keyed by operationId."])
         self.assertEqual(c.summary([]), "")
+
+
+class BackfillTest(unittest.TestCase):
+    def test_targets_are_what_the_sdk_leaves_out_or_marks_unsupported(self):
+        self.assertEqual(c.backfill_targets(manifest(), SPEC), [
+            {"id": "header submitBasicKycSync Response-Signature", "operation": "submitBasicKycSync",
+             "header": "Response-Signature", "path": "POST /v3/basic_kyc/sync", "status": "unsupported: Not exposed yet."},
+            {"id": "operation v3PhoneVerification", "operation": "v3PhoneVerification", "path": "POST /v3/phone",
+             "status": "unsupported: Planned for 13.3.0."},
+        ])
+
+    def test_missing_entries_are_targets_and_opted_out_ones_are_not(self):
+        m = manifest()
+        del m["operations"]["v3PhoneVerification"]
+        del m["operations"]["submitBasicKycSync"]["response_headers"]["Response-Signature"]
+        self.assertEqual([(t["id"], t["status"]) for t in c.backfill_targets(m, SPEC)], [
+            ("header submitBasicKycSync Response-Signature", "not in spec-coverage.json"),
+            ("operation v3PhoneVerification", "not in spec-coverage.json")])
+        m = manifest()
+        m["operations"]["v3PhoneVerification"]["backfill"] = False
+        m["operations"]["submitBasicKycSync"]["response_headers"]["Response-Signature"]["backfill"] = False
+        self.assertEqual(c.backfill_targets(m, SPEC), [])
+        self.assertEqual(c.backfill_targets(None, SPEC)[-1]["id"], "operation v3PhoneVerification")
+
+    def test_supported_as(self):
+        m = manifest()
+        self.assertEqual(c.supported_as(m, "submitBasicKycSync"), "basic_kyc.verify_sync")
+        self.assertEqual(c.supported_as(m, "submitBasicKycSync", "smileid-job-id"),
+                         "BasicKycResult.job_id, SmileIDError.job_id")
+        for args in (("submitBasicKycSync", "Response-Signature"), ("v3PhoneVerification",),
+                     ("v3PhoneVerification", "X"), ("nope",)):
+            self.assertIsNone(c.supported_as(m, *args))
+        m["operations"]["submitBasicKycSync"]["response_headers"] = []
+        self.assertIsNone(c.entry_for(m, "submitBasicKycSync", "SmileID-Job-ID"))
 
 
 class MainTest(unittest.TestCase):
