@@ -78,7 +78,7 @@ jobs:
     steps:
       # Read only: lambda for the identities, and the fixtures for the script.
       - id: read-token
-        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        uses: actions/create-github-app-token@f418cff399f7aef4c2f0ad47e25ca7a6abbdd6fc # v3.4.0
         with:
           client-id: ${{ secrets.SPEC_SYNC_READER_CLIENT_ID }}
           private-key: ${{ secrets.SPEC_SYNC_READER_PRIVATE_KEY }}
@@ -223,7 +223,7 @@ jobs:
       # encrypted bundle, which is checked before use, and the tag name, which
       # is checked against the release pattern.
       - id: fixtures-token
-        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        uses: actions/create-github-app-token@f418cff399f7aef4c2f0ad47e25ca7a6abbdd6fc # v3.4.0
         with:
           client-id: ${{ secrets.SMILE_GHA_BOT_CLIENT_ID }}
           private-key: ${{ secrets.SMILE_GHA_BOT_PRIVATE_KEY }}
