@@ -130,6 +130,19 @@ jobs:
           # Don't revoke the token: it expires after an hour.
           skip-token-revoke: true
 
+      # Only for SMILE_GHA_BOT's slug, so the plan refreshes only PRs the bot opened.
+      # The token can only read pull requests, and nothing here uses it.
+      - id: bot-slug
+        if: steps.secrets.outputs.configured == 'true' && (github.event_name != 'schedule' || github.event.schedule == env.SYNC_CRON)
+        continue-on-error: true
+        uses: actions/create-github-app-token@f418cff399f7aef4c2f0ad47e25ca7a6abbdd6fc # v3.4.0
+        with:
+          client-id: ${{ secrets.SMILE_GHA_BOT_CLIENT_ID }}
+          private-key: ${{ secrets.SMILE_GHA_BOT_PRIVATE_KEY }}
+          owner: smileidentity
+          repositories: smileid-sdk-go
+          permission-pull-requests: read
+
       - id: plan
         name: Plan the jobs
         if: steps.secrets.outputs.configured == 'true'
@@ -140,6 +153,7 @@ jobs:
           BACKFILL: ${{ inputs.backfill }}
           SYNC_DUE: ${{ github.event_name != 'schedule' || github.event.schedule == env.SYNC_CRON }}
           OPEN_PRS_TOKEN: ${{ steps.open-prs-token.outputs.token }}
+          BOT: ${{ steps.bot-slug.outputs.app-slug }}[bot]
         run: |
           # Without pipefail, a failed ls-remote leaves an empty tag list and a misleading error later.
           set -o pipefail

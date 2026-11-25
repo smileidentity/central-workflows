@@ -173,7 +173,7 @@ Run `SDK spec sync` by hand with `backfill` ticked to have Claude add everything
 - For the same reason, an SDK with any other spec-sync PR open is skipped with a warning. Merge or close that PR first. An SDK whose open PRs can't be listed is skipped too.
 - Claude gets the list, with how the other SDKs expose each item as a guide to naming. It works like any other spec-sync job: no write token, and the publish job checks and pushes the change. The publish job runs the coverage check, and lists as a gap anything still unsupported, an added operation whose headers are still unsupported, and anything Claude marked `"backfill": false`. Only a maintainer decides that.
 - A backfill PR that falls behind the newest spec is refreshed like a scoped PR. The refresh leaves `spec-coverage.json` to the rolling PR.
-- The PR opens as a draft and the hourly status job marks it ready once its checks pass, so a maintainer reviews and approves it like any other. The status job acts only on PRs `SMILE_GHA_BOT` opened: a person's PR with the `spec-sync` label is never marked ready, moved to draft or closed.
+- The PR opens as a draft and the hourly status job marks it ready once its checks pass, so a maintainer reviews and approves it like any other. Only PRs `SMILE_GHA_BOT` opened count, matched as `gh` shows an app (`app/<slug>`, flagged as a bot), because anyone who can edit a PR can write its state marker. A person's PR with the `spec-sync` label is never refreshed, marked ready, moved to draft or closed, and the publish job won't push to a branch a person's PR uses.
 
 ## Keep the SDK fixtures in step with sandbox
 
