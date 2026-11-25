@@ -977,7 +977,7 @@ def find_open_pr(repo, branch, token):
     branches of the same name, and the SDK repositories are public."""
     out = gh(
         ["pr", "list", "--repo", f"{ORG}/{repo}", "--head", branch, "--state", "open",
-         "--json", "number,url,isDraft,body,isCrossRepository", "--limit", "20"],
+         "--json", "number,url,isDraft,body,isCrossRepository,author", "--limit", "20"],
         token,
     )
     prs = [pr for pr in json.loads(out or "[]") if not pr.get("isCrossRepository", True)]
@@ -1010,23 +1010,28 @@ def open_pr_info(pr):
             "spec_tag": marker.get("spec_tag", ""), "scope": scope}
 
 
-def list_open_prs(repos, token):
-    """The open spec-sync PRs in each repository, for planning refreshes.
+def list_open_prs(repos, token, bot):
+    """The open spec-sync PRs the bot opened in each repository, for planning refreshes.
 
     A repository that can't be read is left out with a warning, so its PRs are
-    only refreshed on a later run.
+    only refreshed on a later run. A PR a person opened is never refreshed,
+    whatever its label and marker say.
     """
     found = {}
     for repo in repos:
         try:
             out = gh(["pr", "list", "--repo", f"{ORG}/{repo}", "--label", LABEL, "--state", "open",
-                      "--json", "number,url,title,body,headRefName,isCrossRepository", "--limit", "50"], token)
+                      "--json", "number,url,title,body,headRefName,isCrossRepository,author", "--limit", "50"], token)
         except SpecSyncError as e:
             print(f"::warning::Could not list the spec-sync pull requests in {repo}, so none are refreshed: {e}")
             continue
-        found[repo] = [open_pr_info(pr) for pr in json.loads(out or "[]")
-                       if not pr.get("isCrossRepository", True)
-                       and str(pr.get("headRefName", "")).startswith("spec-sync/")]
+        prs = [pr for pr in json.loads(out or "[]") if not pr.get("isCrossRepository", True)
+               and str(pr.get("headRefName", "")).startswith("spec-sync/")]
+        for pr in prs:
+            if not by_bot(pr, bot):
+                print(f"::notice::{pr['url']} has the {LABEL} label, but {author_login(pr)} opened it, not the "
+                      "workflow, so it isn't refreshed.")
+        found[repo] = [open_pr_info(pr) for pr in prs if by_bot(pr, bot)]
     return found
 
 
@@ -1399,6 +1404,9 @@ def publish(*, u, workdir, bundle, out, state_dir, write_token, bot_name, bot_em
     if u["branch"] == default:
         raise SpecSyncError("The spec-sync branch is the default branch, so nothing was pushed")
     pr = find_open_pr(repo, u["branch"], write_token)
+    if pr and not by_bot(pr, bot_name):
+        raise SpecSyncError(f"{pr['url']} on {u['branch']} was opened by {author_login(pr)}, not the workflow, so "
+                            "nothing was pushed. Close it or rename its branch to let the sync use this branch.")
     outcome = {"repo": repo, "branch": u["branch"], "kind": u["kind"], "spec_tag": u["spec_tag"],
                "status": "failed", "pr_url": pr["url"] if pr else ""}
 
@@ -1583,8 +1591,32 @@ def is_behind(spec_tag, latest_api_tag):
     return bool(TAG_RE.match(spec_tag or "") and latest_api_tag and tag_key(spec_tag) < tag_key(latest_api_tag))
 
 
-def promote_prs(repos, token, latest_api_tag=None):
+def bot_slug(bot):
+    return (bot or "").removesuffix("[bot]")
+
+
+def by_bot(pr, bot):
+    """Whether the workflow's bot opened the PR.
+
+    gh shows a GitHub App author as app/<slug> with is_bot set. Only that form
+    counts: the bare slug is how gh shows a user, and anyone could register a
+    user login equal to the app's slug.
+    """
+    slug = bot_slug(bot)
+    author = pr.get("author") or {}
+    return bool(slug) and author.get("is_bot") is True and author.get("login") == f"app/{slug}"
+
+
+def author_login(pr):
+    return (pr.get("author") or {}).get("login") or "unknown"
+
+
+def promote_prs(repos, token, latest_api_tag=None, *, bot):
     """Mark green draft spec-sync PRs ready. Returns the open PRs per repo.
+
+    Only PRs the bot opened count. The state marker in a description isn't
+    enough, because anyone who can edit a PR can write it, so a person's PR
+    with the spec-sync label is never marked ready, moved to draft or closed.
 
     A PR written against an older spec than latest_api_tag goes back to draft,
     so it can't be merged with code the newer spec changed, until the next sync
@@ -1596,7 +1628,7 @@ def promote_prs(repos, token, latest_api_tag=None):
         try:
             out = gh(
                 ["pr", "list", "--repo", f"{ORG}/{repo}", "--label", LABEL, "--state", "open",
-                 "--json", "number,url,title,isDraft,body,headRefName,statusCheckRollup,isCrossRepository,changedFiles",
+                 "--json", "number,url,title,isDraft,body,headRefName,statusCheckRollup,isCrossRepository,changedFiles,author",
                  "--limit", "50"],
                 token,
             )
@@ -1607,6 +1639,10 @@ def promote_prs(repos, token, latest_api_tag=None):
         prs = []
         for pr in json.loads(out or "[]"):
             if pr.get("isCrossRepository", True):
+                continue
+            if not by_bot(pr, bot):
+                print(f"::notice::{pr['url']} has the {LABEL} label, but {author_login(pr)} opened it, not the "
+                      "workflow, so it was left alone.")
                 continue
             if pr.get("changedFiles") == 0 and str(pr.get("headRefName", "")).startswith("spec-sync/"):
                 try:
@@ -1873,19 +1909,25 @@ def main(argv=None):
             backfill = sync_due and args.backfill == "true"
             manifests, specs = {}, {}
             token = os.environ.get("OPEN_PRS_TOKEN", "")
+            # Only PRs this bot opened are refreshed, or block a backfill.
+            bot = os.environ.get("BOT", "")
+            if not bot_slug(bot):
+                token = ""
+                print("::warning::BOT has no app slug, so no open spec-sync PR can be recognised as the workflow's "
+                      "own.")
             # OPEN_PRS_TOKEN reads the SDK repositories' PRs. Without it, open PRs aren't refreshed.
             if backfill:
                 if not token:
                     raise SpecSyncError("A backfill run needs a token that can read the SDK repositories, to read "
                                         f"each {spec_coverage.MANIFEST} and check for open spec-sync PRs")
-                open_prs = list_open_prs(select_repos(args.repos), token)
+                open_prs = list_open_prs(select_repos(args.repos), token, bot)
                 # Every SDK's file is read, whichever repos were chosen, for the parity report.
                 manifests = {repo: fetch_manifest(repo, token) for repo in SDK_REPOS}
                 tags = {m.get("spec_tag") for m in manifests.values() if m}
                 specs = {tag: fetch_spec(tag) for tag in sorted(t for t in tags if isinstance(t, str))}
             elif sync_due and not args.scope.strip():
                 if token:
-                    open_prs = list_open_prs(select_repos(args.repos), token)
+                    open_prs = list_open_prs(select_repos(args.repos), token, bot)
                 else:
                     print("::warning::No token could read the SDK repositories, so open spec-sync PRs that are "
                           "behind the spec are not refreshed in this run.")
@@ -1943,7 +1985,11 @@ def main(argv=None):
             issue_token = os.environ["ISSUE_TOKEN"]
             repo_full = os.environ.get("GITHUB_REPOSITORY", f"{ORG}/central-workflows")
             api_tags = Path(args.api_tags_file).read_text().split() if args.api_tags_file else []
-            prs = promote_prs(ALL_REPOS, token, latest_tag(api_tags))
+            bot = os.environ.get("BOT", "")
+            if not bot_slug(bot):
+                raise SpecSyncError("BOT has no app slug, so no spec-sync PR would count as the workflow's own. "
+                                    "Check the app-token step's app-slug output.")
+            prs = promote_prs(ALL_REPOS, token, latest_tag(api_tags), bot=bot)
             results = [read_json(p, {}) for p in sorted(Path(args.results_dir).glob("**/job-result.json"))]
             issue = find_status_issue(repo_full, issue_token)
             previous = read_marker(issue["body"], ISSUE_MARKER).get("runs", {}) if issue else {}
