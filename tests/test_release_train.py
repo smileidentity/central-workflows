@@ -348,12 +348,93 @@ class PrepareTest(unittest.TestCase):
         self.assertNotIn("GIT_CONFIG_VALUE_0", seen)
 
 
+class AttentionTest(unittest.TestCase):
+    LATEST = {repo: "13.2.0" for repo in t.SDK_REPOS}
+
+    def test_major_release_needs_a_person(self):
+        with mock.patch.object(t, "gh", FakeGh()):
+            report = t.land_batch({"smileid-sdk-go": [release_pr(1, "14.0.0")]}, "tok", self.LATEST)
+        (item,) = t.attention_items(report)
+        self.assertIn("pull/1: v14.0.0 is a major release", item)
+
+    def test_failing_checks_need_a_person_but_waiting_for_approval_does_not(self):
+        prs = {"smileid-sdk-go": [release_pr(1, "13.3.0", checks=("FAILURE",))],
+               "smileid-sdk-java": [release_pr(2, "13.3.0", approved=False)]}
+        with mock.patch.object(t, "gh", FakeGh()):
+            report = t.land_batch(prs, "tok", self.LATEST)
+        (item,) = t.attention_items(report)
+        self.assertIn("pull/1: its checks are failing", item)
+
+    def test_merge_and_tag_failures_need_a_person(self):
+        with mock.patch.object(t, "gh", FakeGh(fail=["pulls/1/merge"])):
+            report = t.land_batch({"smileid-sdk-go": [release_pr(1, "13.3.0")]}, "tok", self.LATEST)
+        report["tag_failed"] = {"smileid-sdk-rust": ["couldn't push the v13.3.0 tag for u. See the run log."]}
+        items = t.attention_items(report)
+        self.assertEqual(len(items), 2)
+        self.assertIn("couldn't merge it", items[0])
+        self.assertTrue(items[1].startswith("rust: couldn't push"))
+
+    def test_nothing_to_report(self):
+        self.assertEqual(t.attention_items({"version": None, "merged": [], "waiting": {}}), [])
+
+
+class AttentionIssueTest(unittest.TestCase):
+    def sync(self, items, open_issues, body=None):
+        calls, posts = [], []
+
+        def fake(args, token, check=True, **kwargs):
+            calls.append(args)
+            if args[:2] == ["issue", "list"]:
+                return json.dumps(open_issues)
+            if args[:2] == ["issue", "create"]:
+                return "https://github.com/smileidentity/central-workflows/issues/9\n"
+            return ""
+
+        with mock.patch.object(t, "gh", fake), mock.patch.object(t, "post_slack", lambda w, text: posts.append(text)):
+            result = t.sync_attention_issue("smileidentity/central-workflows", "tok", items, RUN, "hook")
+        return result, [c[:2] for c in calls], posts
+
+    def test_opens_once_and_posts_to_slack(self):
+        result, calls, posts = self.sync(["a"], [])
+        self.assertEqual(result, "opened")
+        self.assertIn(["issue", "create"], calls)
+        self.assertEqual(len(posts), 1)
+        self.assertIn("issues/9", posts[0])
+
+    def test_rewrites_only_when_the_items_change(self):
+        same = t.render_attention(["a"], "https://example.com/older-run")
+        result, calls, posts = self.sync(["a"], [{"number": 9, "url": "u", "body": same}])
+        self.assertEqual((result, posts), ("open", []))
+        self.assertNotIn(["issue", "edit"], calls)
+        result, calls, posts = self.sync(["a", "b"], [{"number": 9, "url": "u", "body": same}])
+        self.assertIn(["issue", "edit"], calls)
+        self.assertEqual(posts, [])
+
+    def test_closes_when_resolved(self):
+        result, calls, posts = self.sync([], [{"number": 9, "url": "u", "body": "x"}])
+        self.assertEqual(result, "closed")
+        self.assertIn(["issue", "close"], calls)
+        self.assertEqual(posts, ["Resolved: u"])
+
+    def test_quiet_when_nothing_is_wrong(self):
+        self.assertEqual(self.sync([], [])[0], "none")
+
+    def test_slack_failure_is_only_a_warning(self):
+        with mock.patch.object(t.urllib.request, "urlopen", side_effect=OSError("down")):
+            t.post_slack("https://hooks.example.com/x", "hi")
+        t.post_slack("", "skipped")
+
+
 class WorkflowTest(unittest.TestCase):
     def test_daily_cron_matches_plan_cron(self):
         crons = re.findall(r"^\s*- cron: '([^']+)'", WORKFLOW, re.MULTILINE)
         (plan_cron,) = re.findall(r"^\s+PLAN_CRON: '([^']+)'", WORKFLOW, re.MULTILINE)
         self.assertEqual(crons[0], plan_cron)
         self.assertIn(f"github.event.schedule == '{plan_cron}'", WORKFLOW)
+
+    def test_failed_runs_are_reported(self):
+        self.assertIn("uses: ./.github/workflows/scheduled-run-status.yml", WORKFLOW)
+        self.assertIn("needs: [plan, prepare, land]", WORKFLOW)
 
     def test_one_run_at_a_time(self):
         self.assertIn("group: sdk-release-train", WORKFLOW)

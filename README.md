@@ -210,6 +210,14 @@ The train never merges a major release. Merge each major release PR yourself onc
 
 A new commit on an SDK's default branch makes the next daily run rebuild that SDK's release PR. That dismisses its approvals, and the batch waits for it.
 
+### Alerts
+
+Breaking changes and anything else the train can't settle wait for a person, and the train says so:
+
+- While a release needs a person, the land job keeps one issue open here, titled "SDK release needs a person" and labelled `sdk-release-needs-a-person`. That covers a major release waiting to be merged, a release PR with failing checks, and a merge or tag the train couldn't do. Each hourly run rewrites the issue only when the list changes, and closes it once nothing is left. Waiting for an approval doesn't count.
+- A failed run opens an issue labelled `red-lane:sdk-release-train` and `team:sdk`, through the scheduled run status workflow above. The next passing run closes it.
+- Both post to Slack when the `SDK_RELEASE_SLACK_WEBHOOK_URL` secret holds an incoming webhook: the "needs a person" issue when it opens and closes, the red-lane issue as described above.
+
 ### Settings
 
 | Variable | Use |

@@ -29,6 +29,7 @@ import os
 import re
 import subprocess
 import sys
+import urllib.request
 
 ORG = "smileidentity"
 SDK_REPOS = [
@@ -503,19 +504,20 @@ def land_batch(prs_by_repo, token, latest_versions):
         print(f"::warning::{pr['url']} is an older release PR than v{version}; the next planned run closes it.")
     if not batch:
         return {"version": None, "merged": [], "waiting": {}}
+    urls = {repo: pr["url"] for repo, pr in batch.items()}
     waiting = {repo: blockers(pr, version) for repo, pr in batch.items()}
     waiting = {repo: why for repo, why in waiting.items() if why}
     base = max(latest_versions.values(), key=parse_version) if latest_versions else None
     if base and parse_version(version)[0] > parse_version(base)[0]:
         print(f"::notice::v{version} is a major release, so the train won't merge it. Merge each PR yourself once "
               "it's approved; the train pushes the tags.")
-        return {"version": version, "merged": [], "waiting": waiting, "major": True}
+        return {"version": version, "merged": [], "waiting": waiting, "major": True, "urls": urls}
     if waiting:
         for repo, why in waiting.items():
             print(f"{batch[repo]['url']} can't merge yet: {'; '.join(why)}.")
         print(f"Waiting: the v{version} batch merges once every PR in it is approved and green.")
-        return {"version": version, "merged": [], "waiting": waiting}
-    merged = []
+        return {"version": version, "merged": [], "waiting": waiting, "urls": urls}
+    merged, failed = [], []
     for repo, pr in batch.items():
         full = f"{ORG}/{repo}"
         code, _, err = gh(["api", "-X", "PUT", f"repos/{full}/pulls/{pr['number']}/merge",
@@ -523,14 +525,15 @@ def land_batch(prs_by_repo, token, latest_versions):
                            "-f", f"commit_title={release_title(version)} (#{pr['number']})"], token, check=False)
         if code != 0:
             print(f"::error::Could not merge {pr['url']}: {err.strip()[-500:]}")
+            failed.append(repo)
             continue
         merged.append(repo)
         print(f"Merged {pr['url']}")
         gh(["api", "-X", "DELETE", f"repos/{full}/git/refs/heads/{pr['headRefName']}"], token, check=False)
-    return {"version": version, "merged": merged, "waiting": {}}
+    return {"version": version, "merged": merged, "waiting": {}, "urls": urls, "merge_failed": failed}
 
 
-def tag_merged(repo, token, latest, now):
+def tag_merged(repo, token, latest, now, errors=None):
     """Push the tag for each recently merged release PR that has none. Returns the tags pushed."""
     full = f"{ORG}/{repo}"
     out = gh(["pr", "list", "--repo", full, "--label", LABEL, "--state", "merged", "--json",
@@ -551,11 +554,90 @@ def tag_merged(repo, token, latest, now):
                            "-f", f"sha={sha}"], token, check=False)
         if code != 0:
             print(f"::error::Could not push v{version} to {full} at {sha}: {err.strip()[-500:]}")
+            if errors is not None:
+                errors.append(f"couldn't push the v{version} tag for {pr['url']}. See the run log.")
             continue
         print(f"Pushed v{version} to {full} at {sha}, from {pr['url']}")
         pushed.append(f"v{version}")
         latest = version
     return pushed
+
+
+# ---------------------------------------------------------------------------
+# Alerts: one issue in this repository while a release needs a person
+
+
+ATTENTION_LABEL = "sdk-release-needs-a-person"
+ATTENTION_TITLE = "SDK release needs a person"
+
+
+def attention_items(report):
+    """What only a person can fix. Waiting for an approval is normal and isn't listed."""
+    version, urls = report.get("version"), report.get("urls", {})
+    items = []
+    if report.get("major"):
+        for repo, url in urls.items():
+            items.append(f"{url}: v{version} is a major release. Review it, then merge it yourself; "
+                         "the train pushes the tag.")
+    for repo, why in report.get("waiting", {}).items():
+        if any("checks are failure" in w for w in why) and not report.get("major"):
+            items.append(f"{urls[repo]}: its checks are failing, so the v{version} batch can't merge.")
+    for repo in report.get("merge_failed", []):
+        items.append(f"{urls[repo]}: the train couldn't merge it. See the run log.")
+    for repo, errors in report.get("tag_failed", {}).items():
+        items += [f"{short(repo)}: {e}" for e in errors]
+    return items
+
+
+def render_attention(items, run_url):
+    return "\n".join([
+        "The SDK release train has found something only a person can fix. The train rewrites this issue each hour "
+        "and closes it once nothing is left.",
+        "",
+        *[f"- {item}" for item in items],
+        "",
+        f"Last checked by {run_url}.",
+    ]) + "\n"
+
+
+def post_slack(webhook, text):
+    """Post to a Slack incoming webhook. A failure is a warning, never an error."""
+    if not webhook:
+        return
+    try:
+        request = urllib.request.Request(webhook, data=json.dumps({"text": text}).encode(),
+                                         headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(request, timeout=20):
+            pass
+    except Exception as e:  # noqa: BLE001 - Slack must never fail the run
+        print(f"::warning::Could not post to Slack: {type(e).__name__}")
+
+
+def sync_attention_issue(repo_full, token, items, run_url, webhook=""):
+    """Open, rewrite or close the issue. Slack hears only when it opens or closes."""
+    found = json.loads(gh(["issue", "list", "--repo", repo_full, "--label", ATTENTION_LABEL, "--state", "open",
+                           "--json", "number,url,body", "--limit", "5"], token) or "[]")
+    issue = found[0] if found else None
+    if items:
+        body = render_attention(items, run_url)
+        if issue:
+            # Only the run link changed: leave the issue alone so watchers aren't notified.
+            if issue.get("body", "").split("Last checked by")[0] != body.split("Last checked by")[0]:
+                gh(["issue", "edit", str(issue["number"]), "--repo", repo_full, "--body", body], token)
+            return "open"
+        gh(["label", "create", ATTENTION_LABEL, "--repo", repo_full, "--force", "--color", "d93f0b",
+            "--description", "The SDK release train needs a person"], token)
+        url = gh(["issue", "create", "--repo", repo_full, "--title", ATTENTION_TITLE, "--label", ATTENTION_LABEL,
+                  "--body", body], token).strip()
+        print(f"::warning::An SDK release needs a person: {url}")
+        post_slack(webhook, f"An SDK release needs a person: {url}\n" + "\n".join(f"- {i}" for i in items))
+        return "opened"
+    if issue:
+        gh(["issue", "close", str(issue["number"]), "--repo", repo_full, "--comment",
+            f"Nothing needs a person any more, as of {run_url}."], token)
+        post_slack(webhook, f"Resolved: {issue['url']}")
+        return "closed"
+    return "none"
 
 
 def land(token, now, repos=None):
@@ -576,18 +658,22 @@ def land(token, now, repos=None):
             print(f"::warning::Could not read {repo}, so its release PRs were left alone: {e}")
     latest_versions = {r: v for r, v in latest_versions.items() if v}
     report = land_batch(prs_by_repo, token, latest_versions)
-    tags = {}
+    tags, tag_failed = {}, {}
     for repo in repos:
         if repo not in latest_versions and repo not in prs_by_repo:
             continue
         try:
-            pushed = tag_merged(repo, token, latest_versions.get(repo), now)
+            errors = []
+            pushed = tag_merged(repo, token, latest_versions.get(repo), now, errors)
+            if errors:
+                tag_failed[repo] = errors
         except TrainError as e:
             print(f"::warning::Could not check {repo} for untagged releases: {e}")
             continue
         if pushed:
             tags[repo] = pushed
     report["tags"] = tags
+    report["tag_failed"] = tag_failed
     return report
 
 
@@ -684,7 +770,12 @@ def main(argv=None):
                 lines.append("No open release PRs.")
             for repo, pushed in report["tags"].items():
                 lines.append(f"- Pushed {', '.join(pushed)} to {short(repo)}.")
+            items = attention_items(report)
+            if items:
+                lines += ["", "Needs a person:", *[f"- {i}" for i in items]]
             write_summary("\n".join(lines) + "\n")
+            sync_attention_issue(os.environ["GITHUB_REPOSITORY"], os.environ["ISSUE_TOKEN"], items,
+                                 os.environ.get("RUN_URL", ""), os.environ.get("SLACK_WEBHOOK_URL", ""))
     except TrainError as e:
         print(f"::error::{e}")
         return 1

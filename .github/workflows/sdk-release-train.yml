@@ -13,6 +13,12 @@ name: SDK release train
 # in it is approved and all its checks pass, and pushes a v* tag on each merged
 # release PR that has none. Each SDK's release.yml publishes from the tag. The
 # train never merges a major release; a person does, and the train then tags it.
+#
+# Alerts: while a release needs a person (a major release, failing checks on a
+# release PR, or a merge or tag the train couldn't do), the land job keeps one
+# "SDK release needs a person" issue open here. A failed run opens a red-lane
+# issue through scheduled-run-status.yml. Both post to Slack when
+# SDK_RELEASE_SLACK_WEBHOOK_URL is set.
 on:
   schedule:
     - cron: '0 7 * * *' # daily: open or update release PRs; keep in step with PLAN_CRON
@@ -110,6 +116,10 @@ jobs:
     if: ${{ always() }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    permissions:
+      contents: read
+      # For the "SDK release needs a person" issue in this repository.
+      issues: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -131,4 +141,21 @@ jobs:
       - name: Merge an approved batch and push tags
         env:
           WRITE_TOKEN: ${{ steps.write-token.outputs.token }}
+          ISSUE_TOKEN: ${{ github.token }}
+          SLACK_WEBHOOK_URL: ${{ secrets.SDK_RELEASE_SLACK_WEBHOOK_URL }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: python3 scripts/release_train/release_train.py land
+
+  # A failed run opens (or comments on) an issue here, and the next passing run
+  # closes it. See "Report scheduled run status" in the README.
+  report:
+    needs: [plan, prepare, land]
+    if: ${{ !cancelled() }}
+    permissions:
+      issues: write
+    uses: ./.github/workflows/scheduled-run-status.yml
+    with:
+      failed: ${{ contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') }}
+      team: team:sdk
+    secrets:
+      slack-webhook-url: ${{ secrets.SDK_RELEASE_SLACK_WEBHOOK_URL }}
