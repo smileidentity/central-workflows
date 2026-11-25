@@ -1,0 +1,134 @@
+name: SDK release train
+
+# Releases the V3 SDKs at one shared version. See "Release the SDKs" in README.md.
+#
+# Once a day, the plan job finds the SDKs that are due a release under
+# SDK_RELEASE_CADENCE (and SDK_RELEASE_CADENCE_OVERRIDES) and have entries under
+# Unreleased in CHANGELOG.md. It picks one version for the run: the highest bump
+# those SDKs need, applied to the highest version any SDK has released. The
+# prepare jobs run each SDK's scripts/bump-version.sh at that version and open
+# or update one release PR per SDK.
+#
+# Every hour, the land job merges the newest batch of release PRs once every PR
+# in it is approved and all its checks pass, and pushes a v* tag on each merged
+# release PR that has none. Each SDK's release.yml publishes from the tag. The
+# train never merges a major release; a person does, and the train then tags it.
+on:
+  schedule:
+    - cron: '0 7 * * *' # daily: open or update release PRs; keep in step with PLAN_CRON
+    - cron: '45 * * * *' # hourly: merge an approved batch and push tags
+  workflow_dispatch:
+    inputs:
+      repos:
+        description: Optional comma-separated SDKs to release now, such as "go,python". Default is every SDK with unreleased changes. A manual run ignores the cadence.
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+
+env:
+  PLAN_CRON: '0 7 * * *'
+
+# One run at a time, so two runs never push the same release branch or merge twice.
+concurrency:
+  group: sdk-release-train
+  cancel-in-progress: false
+
+jobs:
+  plan:
+    if: github.event_name == 'workflow_dispatch' || github.event.schedule == '0 7 * * *' || vars.SDK_RELEASE_CADENCE == 'on-merge' || contains(vars.SDK_RELEASE_CADENCE_OVERRIDES, 'on-merge')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      has_work: ${{ steps.plan.outputs.has_work }}
+      matrix: ${{ steps.plan.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - id: read-token
+        uses: actions/create-github-app-token@f418cff399f7aef4c2f0ad47e25ca7a6abbdd6fc # v3.4.0
+        with:
+          client-id: ${{ secrets.SPEC_SYNC_READER_CLIENT_ID }}
+          private-key: ${{ secrets.SPEC_SYNC_READER_PRIVATE_KEY }}
+          owner: smileidentity
+          repositories: smileid-sdk-go,smileid-sdk-java,smileid-sdk-js,smileid-sdk-php,smileid-sdk-python,smileid-sdk-ruby,smileid-sdk-rust
+          permission-contents: read
+          permission-pull-requests: read
+      - id: plan
+        name: Plan the releases
+        env:
+          READ_TOKEN: ${{ steps.read-token.outputs.token }}
+          CADENCE: ${{ vars.SDK_RELEASE_CADENCE }}
+          OVERRIDES: ${{ vars.SDK_RELEASE_CADENCE_OVERRIDES }}
+          REPOS: ${{ inputs.repos }}
+          EVENT: ${{ github.event_name }}
+          DAILY_RUN: ${{ github.event.schedule == env.PLAN_CRON }}
+        run: |
+          python3 scripts/release_train/release_train.py plan --cadence "$CADENCE" --overrides "$OVERRIDES" \
+            --repos "$REPOS" --event "$EVENT" --daily-run "$DAILY_RUN"
+
+  prepare:
+    needs: plan
+    if: needs.plan.outputs.has_work == 'true'
+    name: ${{ matrix.repo }} v${{ matrix.version }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - id: write-token
+        uses: actions/create-github-app-token@f418cff399f7aef4c2f0ad47e25ca7a6abbdd6fc # v3.4.0
+        with:
+          client-id: ${{ secrets.SMILE_GHA_BOT_CLIENT_ID }}
+          private-key: ${{ secrets.SMILE_GHA_BOT_PRIVATE_KEY }}
+          owner: smileidentity
+          repositories: ${{ matrix.repo }}
+          permission-contents: write
+          permission-pull-requests: write
+      - name: Open or update the release PR
+        env:
+          UNIT: ${{ toJSON(matrix) }}
+          WRITE_TOKEN: ${{ steps.write-token.outputs.token }}
+          GH_TOKEN: ${{ steps.write-token.outputs.token }}
+          BOT: ${{ steps.write-token.outputs.app-slug }}[bot]
+          REVIEWERS: ${{ vars.SDK_RELEASE_REVIEWERS }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          bot_id=$(gh api "/users/${BOT/\[bot\]/%5Bbot%5D}" --jq .id)
+          python3 scripts/release_train/release_train.py prepare --unit "$UNIT" --workdir "$RUNNER_TEMP/sdk" \
+            --bot-name "$BOT" --bot-email "$bot_id+$BOT@users.noreply.github.com" --run-url "$RUN_URL" \
+            --reviewers "$REVIEWERS"
+
+  land:
+    needs: [plan, prepare]
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - id: write-token
+        uses: actions/create-github-app-token@f418cff399f7aef4c2f0ad47e25ca7a6abbdd6fc # v3.4.0
+        with:
+          client-id: ${{ secrets.SMILE_GHA_BOT_CLIENT_ID }}
+          private-key: ${{ secrets.SMILE_GHA_BOT_PRIVATE_KEY }}
+          owner: smileidentity
+          repositories: smileid-sdk-go,smileid-sdk-java,smileid-sdk-js,smileid-sdk-php,smileid-sdk-python,smileid-sdk-ruby,smileid-sdk-rust
+          # Merging and pushing tags need contents write.
+          permission-contents: write
+          permission-pull-requests: write
+          permission-checks: read
+          permission-statuses: read
+          # gh pr list --json statusCheckRollup reads each check's workflow run.
+          permission-actions: read
+      - name: Merge an approved batch and push tags
+        env:
+          WRITE_TOKEN: ${{ steps.write-token.outputs.token }}
+        run: python3 scripts/release_train/release_train.py land

@@ -730,7 +730,7 @@ jobs:
       - name: Keep the scheduled workflows enabled
         env:
           GH_TOKEN: ${{ github.token }}
-          WORKFLOWS: sdk-spec-sync.yml sdk-fixtures-personas.yml pr-hygiene.yml
+          WORKFLOWS: sdk-spec-sync.yml sdk-fixtures-personas.yml pr-hygiene.yml sdk-release-train.yml
         run: |
           for workflow in $WORKFLOWS; do
             state=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/$workflow" --jq .state)
