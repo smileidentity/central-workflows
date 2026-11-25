@@ -203,12 +203,18 @@ All seven V3 SDKs share one version number. `sdk-release-train.yml` releases onl
    - minor if Unreleased has an Added or Deprecated section
    - patch otherwise
 3. It applies the highest of those bumps to the highest version any SDK has released. That is the version for the run. SDKs with nothing to release skip it, so an SDK can go from 13.1.0 straight to 13.3.0.
-4. For each SDK, a prepare job runs the SDK's own `scripts/bump-version.sh <version>` on its default branch. The job pushes `release/v<version>` and opens one PR labelled `release`, or updates the open one. It asks the people in `SDK_RELEASE_REVIEWERS` to review. A release PR already at that version and built on the current default branch is left alone, so its approvals are kept. A release PR for an older version is closed.
+   - While a batch is still landing, its version is kept. An SDK whose release PR is still open is planned at that version again, and tags from that batch don't raise the base. So when one SDK of a v14.0.0 batch is merged and tagged, the others stay at v14.0.0, not v15.0.0.
+   - A new SDK joins the open batch when its version covers what that SDK needs. Only a bigger bump moves the batch to a new version, which rebuilds its PRs.
+4. For each SDK, a bump job runs the SDK's own `scripts/bump-version.sh <version>` on its default branch and hands the change to a publish job as a patch. The publish job applies it to a fresh clone, pushes `release/v<version>` and opens one PR labelled `release`, or updates the open one. It asks the people in `SDK_RELEASE_REVIEWERS` to review. A release PR already at that version and built on the current default branch is left alone, so its approvals are kept. A release PR for an older version is closed.
 5. Every hour, the land job looks at the open release PRs at the newest version. It merges them all, by squash, once every one is approved, has passing checks and is up to date with its base branch. Then it pushes a `v<version>` tag on each merge commit, and each SDK's `release.yml` publishes the package.
 
-The train never merges a major release. Merge each major release PR yourself once it's approved, and the next hourly run pushes its tag. The train also tags any other release PR merged in the last 14 days whose version is newer than the SDK's last tag.
+The train never merges a major release. It judges this against each SDK's own last release, and records it in the PR, so the rest of a major batch stays manual after one SDK is tagged. Merge each major release PR yourself once it's approved, and the next hourly run pushes its tag. The train also tags any other release PR merged in the last 14 days whose version is newer than the SDK's last tag.
 
 A new commit on an SDK's default branch makes the next daily run rebuild that SDK's release PR. That dismisses its approvals, and the batch waits for it.
+
+SDKs with different cadences can share a batch. For example, with `{"rust": "weekly"}`, Monday's run can put Go and Rust in one batch. Go's PR stays at that version on the following days, and the batch merges once Rust's PR is approved too.
+
+Release PRs a person opens, such as one cut by hand, are left alone. They never join a batch and the train never tags them. If someone pushes a commit to one of the train's own release PRs, the train won't rebuild that PR over it: the publish job fails until the PR is closed or its branch is reset. The train also refuses to push to an existing `release/v<version>` branch unless one of its own open PRs uses it. That publish job fails, which raises the failed-run alert. If the train pushes a branch but can't open its PR, it deletes the branch so the next run isn't blocked.
 
 ### Alerts
 
@@ -228,7 +234,12 @@ Breaking changes and anything else the train can't settle wait for a person, and
 
 `on-merge` SDKs are checked every hour, not once a day. A manual run ignores the cadence and can name the SDKs to release in `repos`.
 
-The plan job reads with `SPEC_SYNC_READER`. The prepare and land jobs use `SMILE_GHA_BOT` with contents and pull requests write. The bump script runs without the job's environment, so it can't read the bot's token. The train merges and tags only release PRs its bot opened: the state marker in a PR description isn't enough, because anyone who can edit the PR can write it. Merging needs an approval, as for any other PR: the bot has no bypass. Because the bot pushes the tags, not `GITHUB_TOKEN`, the SDKs' release workflows run.
+The SDK's bump script never shares a job with a write token, as Claude never does in the spec sync:
+
+- The bump job has no `SMILE_GHA_BOT` key, no bundle key and no `GITHUB_TOKEN` permissions. It clones with a `SPEC_SYNC_READER` token in an earlier step (`smileid-sdk-rust` is private), then turns off root and Docker. The script runs as its own unprivileged user, `bumper`, with an empty environment and its own copy of the clone. That user can't read the job's processes or files, such as the reader key or the artifact upload token, and all its processes are killed before the next step. It uploads the patch encrypted to `BUNDLE_CERT`, because this repository's artifacts are public.
+- The publish job holds `SMILE_GHA_BOT` (contents and pull requests write on that one SDK) and runs only `git`, `gh`, `tar` and `openssl`. It decrypts the bundle with `SPEC_SYNC_BUNDLE_KEY`, accepts only `meta.json` and `patch.diff`, and applies the patch to a fresh clone that nothing else has touched. It refuses a patch that changes `.github/` or `.gitmodules` (checking raw paths, so unusual characters can't hide one), and a bundle made against an older commit than the default branch. It takes the PR's changelog notes from its own clone, not from the bundle, and only the last state marker in a PR description counts.
+
+The plan job reads with `SPEC_SYNC_READER`, and mints a `SMILE_GHA_BOT` token that can only read pull requests, just to learn the bot's name. The land job uses `SMILE_GHA_BOT` with contents and pull requests write. The train merges and tags only release PRs its bot opened: the state marker in a PR description isn't enough, because anyone who can edit the PR can write it. Merging needs an approval, as for any other PR: the bot has no bypass. Because the bot pushes the tags, not `GITHUB_TOKEN`, the SDKs' release workflows run.
 
 ## Merge safety
 

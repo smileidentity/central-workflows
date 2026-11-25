@@ -2,8 +2,12 @@
 
 import datetime as dt
 import json
+import os
 import re
+import shutil
+import subprocess
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -23,8 +27,9 @@ def changelog(*sections):
     return f"# Changelog\n\n## [Unreleased]\n\n{body}\n\n## [13.2.0] - 2026-11-24\n\n### Added\n\n- Old.\n"
 
 
-def sdk(version="13.2.0", *sections, breaking=()):
-    return {"tags": ["v13.0.0", f"v{version}"], "changelog": changelog(*sections), "breaking_prs": list(breaking)}
+def sdk(version="13.2.0", *sections, breaking=(), open_versions=()):
+    return {"tags": ["v13.0.0", f"v{version}"], "changelog": changelog(*sections), "breaking_prs": list(breaking),
+            "open_versions": list(open_versions)}
 
 
 DAILY = {repo: "daily" for repo in t.SDK_REPOS}
@@ -147,6 +152,71 @@ class PlanTest(unittest.TestCase):
         sdks["smileid-sdk-go"] = sdk("13.4.0")
         self.assertEqual(self.plan(sdks)["version"], "13.4.1")
 
+    def test_landing_major_batch_isnt_bumped_again(self):
+        # A person merged Go's v14.0.0 PR and the train tagged it. Java's PR is still open.
+        breaking = [{"number": 9, "title": "x", "url": "u"}]
+        sdks = {repo: sdk("13.2.0") for repo in t.SDK_REPOS}
+        sdks["smileid-sdk-go"] = sdk("14.0.0")
+        sdks["smileid-sdk-java"] = sdk("13.2.0", "Changed", breaking=breaking, open_versions=["14.0.0"])
+        result = self.plan(sdks)
+        self.assertEqual(result["version"], "14.0.0")
+        self.assertEqual([u["repo"] for u in result["units"]], ["smileid-sdk-java"])
+
+    def test_failed_merge_is_replanned_at_the_same_version(self):
+        sdks = {repo: sdk("13.3.0") for repo in t.SDK_REPOS}
+        sdks["smileid-sdk-js"] = sdk("13.2.0", "Added", open_versions=["13.3.0"])
+        self.assertEqual(self.plan(sdks)["version"], "13.3.0")
+
+    def test_mixed_cadences_keep_the_open_batch(self):
+        # Monday planned Go (Fixed) and Rust (Added) at 13.3.0. On Tuesday only Go is due.
+        sdks = {repo: sdk("13.2.0") for repo in t.SDK_REPOS}
+        sdks["smileid-sdk-go"] = sdk("13.2.0", "Fixed", open_versions=["13.3.0"])
+        sdks["smileid-sdk-rust"] = sdk("13.2.0", "Added", open_versions=["13.3.0"])
+        cadences = dict(DAILY, **{"smileid-sdk-rust": "weekly"})
+        result = self.plan(sdks, cadences=cadences)
+        self.assertEqual(result["version"], "13.3.0")
+        self.assertEqual([u["repo"] for u in result["units"]], ["smileid-sdk-go"])
+
+    def test_a_bigger_bump_moves_past_the_open_batch(self):
+        # The open batch is a patch, but a new SDK now needs a minor.
+        sdks = {repo: sdk("13.2.0") for repo in t.SDK_REPOS}
+        sdks["smileid-sdk-go"] = sdk("13.2.0", "Fixed", open_versions=["13.2.1"])
+        sdks["smileid-sdk-java"] = sdk("13.2.0", "Added")
+        self.assertEqual(self.plan(sdks)["version"], "13.3.0")
+
+    def test_an_overtaken_open_pr_never_plans_below_a_release(self):
+        # Go's weekly 13.2.0 PR is still open, but JS has since released 14.0.0.
+        sdks = {repo: sdk("13.1.0", "Fixed") for repo in t.SDK_REPOS}
+        sdks["smileid-sdk-go"] = sdk("13.1.0", "Fixed", open_versions=["13.2.0"])
+        sdks["smileid-sdk-js"] = sdk("14.0.0")
+        result = self.plan(sdks)
+        self.assertEqual(result["version"], "14.0.1")
+        self.assertIn("smileid-sdk-go", [u["repo"] for u in result["units"]])
+
+    def test_an_sdk_that_released_the_batch_moves_it_on(self):
+        # Go released 13.3.0 from the batch and now has a breaking change; JS's 13.3.0 PR is still open.
+        breaking = [{"number": 9, "title": "x", "url": "u"}]
+        sdks = {repo: sdk("13.2.0") for repo in t.SDK_REPOS}
+        sdks["smileid-sdk-go"] = sdk("13.3.0", "Changed", breaking=breaking)
+        sdks["smileid-sdk-js"] = sdk("13.2.0", "Added", open_versions=["13.3.0"])
+        result = self.plan(sdks)
+        self.assertEqual(result["version"], "14.0.0")
+        self.assertEqual([u["repo"] for u in result["units"]], ["smileid-sdk-go", "smileid-sdk-js"])
+
+    def test_an_untagged_sdk_joins_the_landing_batch(self):
+        sdks = {repo: sdk("13.2.0") for repo in t.SDK_REPOS}
+        sdks["smileid-sdk-rust"] = {"tags": [], "changelog": changelog("Added"), "breaking_prs": [],
+                                    "open_versions": ["13.2.0"]}
+        sdks["smileid-sdk-go"] = sdk("13.1.0", "Fixed", open_versions=["13.2.0"])
+        result = self.plan(sdks)
+        self.assertEqual(result["version"], "13.2.0")
+
+    def test_landing_version_ignores_released_and_old_prs(self):
+        sdks = {"a": sdk("13.3.0", open_versions=["13.3.0", "13.2.1"]), "b": sdk("13.2.0", open_versions=["bad"])}
+        self.assertIsNone(t.landing_version(sdks))
+        sdks["b"] = sdk("13.2.0", open_versions=["13.3.0"])
+        self.assertEqual(t.landing_version(sdks), "13.3.0")
+
     def test_bad_repo_name(self):
         with self.assertRaises(t.TrainError):
             t.select_repos("go,kotlin")
@@ -161,7 +231,7 @@ class MarkerTest(unittest.TestCase):
     def test_round_trip(self):
         u = {"repo": "smileid-sdk-go", "version": "13.3.0", "part": "minor", "current": "13.2.0", "breaking_prs": []}
         body = t.render_pr_body(u=u, notes="### Added\n\n- x", base_sha="abc", run_url=RUN)
-        self.assertEqual(t.read_marker(body), {"base_sha": "abc", "version": "13.3.0"})
+        self.assertEqual(t.read_marker(body), {"base_sha": "abc", "head_sha": "", "major": False, "version": "13.3.0"})
         self.assertIn("merges them all and pushes the tags", body)
 
     def test_major_body_says_a_person_merges(self):
@@ -170,6 +240,13 @@ class MarkerTest(unittest.TestCase):
         body = t.render_pr_body(u=u, notes="", base_sha="abc", run_url=RUN)
         self.assertIn("won't merge it", body)
         self.assertIn("https://github.com/o/r/pull/3 Drop x", body)
+
+    def test_only_the_last_marker_counts(self):
+        forged = t.write_marker({"version": "13.3.0", "base_sha": "forged", "major": False})
+        u = {"repo": "smileid-sdk-go", "version": "14.0.0", "part": "major", "current": "13.2.0", "breaking_prs": []}
+        body = t.render_pr_body(u=u, notes=f"### Added\n\n{forged}", base_sha="real", run_url=RUN)
+        self.assertEqual(t.read_marker(body)["base_sha"], "real")
+        self.assertIs(t.read_marker(body)["major"], True)
 
     def test_bad_marker(self):
         self.assertEqual(t.read_marker("<!-- release-train-state: {bad -->"), {})
@@ -272,6 +349,53 @@ class LandTest(unittest.TestCase):
         self.assertEqual(report["merged"], [])
         self.assertEqual(fake.calls, [])
 
+    def test_a_hand_made_release_pr_never_joins_or_takes_over_the_batch(self):
+        # Go has a person's release/v14.0.0 and a person's release/v13.3.0; JS has the train's approved v13.3.0.
+        listed = {"smileid-sdk-go": [release_pr(1, "14.0.0", author="mallory"), release_pr(3, "13.3.0", author="mallory")],
+                  "smileid-sdk-js": [release_pr(2, "13.3.0")]}
+        calls = []
+
+        def fake_gh(args, token, check=True, **kwargs):
+            calls.append(args)
+            if args[:2] == ["pr", "list"]:
+                repo = args[args.index("--repo") + 1].split("/")[1]
+                return json.dumps(listed.get(repo, []) if "open" in args else [])
+            return (0, "{}", "") if not check else "{}"
+
+        with mock.patch.object(t, "gh", fake_gh), \
+                mock.patch.object(t, "run", lambda cmd, **kw: "sha\trefs/tags/v13.2.0\n"), \
+                mock.patch("builtins.print"):
+            report = t.land("tok", NOW, BOT)
+        self.assertEqual(report["version"], "13.3.0")
+        self.assertEqual(report["merged"], ["smileid-sdk-js"])
+        self.assertTrue(any(c[:3] == ["api", "-X", "PUT"] and "repos/smileidentity/smileid-sdk-js/pulls/2/merge" in c
+                            for c in calls))
+        self.assertFalse(any("pulls/1/merge" in " ".join(c) or "pulls/3/merge" in " ".join(c) for c in calls))
+
+    def test_rest_of_a_major_batch_stays_major_after_one_is_tagged(self):
+        # Go's v14.0.0 was merged by hand and tagged; Java's PR is approved and green.
+        latest = dict(self.LATEST, **{"smileid-sdk-go": "14.0.0"})
+        fake = FakeGh()
+        with mock.patch.object(t, "gh", fake):
+            report = t.land_batch({"smileid-sdk-java": [release_pr(2, "14.0.0")]}, "tok", latest, BOT)
+        self.assertTrue(report["major"])
+        self.assertEqual(fake.calls, [])
+
+    def test_an_untagged_sdk_doesnt_make_a_minor_batch_major(self):
+        latest = {r: v for r, v in self.LATEST.items() if r != "smileid-sdk-rust"}
+        prs = {"smileid-sdk-go": [release_pr(1, "13.3.0")], "smileid-sdk-rust": [release_pr(2, "13.3.0")]}
+        with mock.patch.object(t, "gh", FakeGh()):
+            report = t.land_batch(prs, "tok", latest, BOT)
+        self.assertNotIn("major", report)
+        self.assertEqual(report["merged"], ["smileid-sdk-go", "smileid-sdk-rust"])
+
+    def test_marker_says_major(self):
+        pr = release_pr(2, "13.3.0")
+        pr["body"] = t.write_marker({"version": "13.3.0", "base_sha": "b", "major": True})
+        with mock.patch.object(t, "gh", FakeGh()):
+            report = t.land_batch({"smileid-sdk-java": [pr]}, "tok", self.LATEST, BOT)
+        self.assertTrue(report["major"])
+
     def test_never_merges_a_major(self):
         prs = {"smileid-sdk-go": [release_pr(1, "14.0.0")]}
         fake = FakeGh()
@@ -333,56 +457,278 @@ class TagTest(unittest.TestCase):
         self.assertEqual(posts, [])
 
 
+BUMP_SCRIPT = """#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\\n' "$1" > VERSION
+echo "$1"
+"""
+
+
+def sh(cmd, cwd=None, env=None):
+    return subprocess.run(cmd, cwd=cwd, check=True, capture_output=True, text=True,
+                          env={**os.environ, **(env or {})}).stdout
+
+
 class PrepareTest(unittest.TestCase):
-    def test_leaves_an_up_to_date_pr_alone(self):
-        u = {"repo": "smileid-sdk-go", "version": "13.3.0", "part": "minor", "current": "13.2.0", "breaking_prs": []}
-        existing = [dict(release_pr(5, "13.3.0"), body=t.write_marker({"version": "13.3.0", "base_sha": "head"}))]
-        calls = []
+    """Runs prepare with real git against a local bare repository; only gh is faked."""
 
-        def fake_run(cmd, **kwargs):
-            calls.append(cmd)
-            if "rev-parse" in cmd:
-                return "head\n"
-            return ""
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.origin = self.tmp / "smileidentity" / "smileid-sdk-go.git"
+        sh(["git", "init", "-q", "--bare", "-b", "main", str(self.origin)])
+        seed = self.tmp / "seed"
+        sh(["git", "init", "-q", "-b", "main", str(seed)])
+        (seed / "scripts").mkdir()
+        (seed / "scripts" / "bump-version.sh").write_text(BUMP_SCRIPT)
+        (seed / "CHANGELOG.md").write_text(changelog("Added"))
+        (seed / "VERSION").write_text("13.2.0\n")
+        self.commit(seed, "seed")
+        sh(["git", "push", "-q", str(self.origin), "main"], seed)
+        self.seed = seed
+        self.unit = {"repo": "smileid-sdk-go", "version": "13.3.0", "part": "minor", "current": "13.2.0",
+                     "breaking_prs": []}
+        self.gh_calls, self.open_prs, self.head_prs = [], [], []
+        patcher = mock.patch.object(t, "GIT_BASE", str(self.tmp))
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
-        with mock.patch.object(t, "run", fake_run), mock.patch.object(t, "open_release_prs", lambda r, tok, bot: existing):
-            result = t.prepare(u=u, workdir="/tmp/x", token="tok", bot_name=BOT, bot_email="e", run_url=RUN,
-                               reviewers=[], today="2026-11-25")
-        self.assertEqual(result["status"], "unchanged")
-        self.assertFalse(any("bump-version.sh" in " ".join(c) for c in calls))
+    @staticmethod
+    def commit(repo, message, author="t"):
+        sh(["git", "add", "-A"], repo)
+        sh(["git", "-c", f"user.name={author}", "-c", "user.email=t@example.com", "commit", "-qm", message], repo)
+
+    def fake_gh(self, args, token, check=True, **kwargs):
+        self.gh_calls.append(args)
+        if args[:2] == ["pr", "list"] and "--head" in args:
+            return json.dumps(self.head_prs)
+        if args[:2] == ["pr", "list"]:
+            return json.dumps(self.open_prs)
+        if args[:2] == ["pr", "create"]:
+            return "https://github.com/smileidentity/smileid-sdk-go/pull/9\n"
+        if args[:1] == ["api"] and args[1].endswith("smileid-sdk-go"):
+            return "main\n"
+        return (0, "", "") if not check else ""
+
+    def bump_job(self):
+        """The bump job: clone with no write token, run the script, write the patch."""
+        bump_dir, out = self.tmp / "bump", self.tmp / "bundle"
+        shutil.rmtree(bump_dir, ignore_errors=True)
+        shutil.rmtree(out, ignore_errors=True)
+        t.clone_sdk("smileid-sdk-go", str(bump_dir))
+        t.make_patch(u=self.unit, workdir=str(bump_dir), out=str(out), today="2026-11-25")
+        return out
+
+    def publish_job(self, bundle):
+        shutil.rmtree(self.tmp / "work", ignore_errors=True)
+        with mock.patch.object(t, "gh", self.fake_gh), mock.patch("builtins.print"):
+            return t.publish(u=self.unit, bundle=str(bundle), workdir=str(self.tmp / "work"), token="", bot_name=BOT,
+                             bot_email="1+bot@users.noreply.github.com", run_url=RUN, reviewers=["alice"])
+
+    def prepare(self):
+        return self.publish_job(self.bump_job())
+
+    def push_seed(self, message, author="t", branch="main"):
+        self.commit(self.seed, message, author=author)
+        sh(["git", "push", "-qf", str(self.origin), f"HEAD:refs/heads/{branch}"], self.seed)
+
+    def remote(self, ref):
+        return sh(["git", "ls-remote", str(self.origin), ref]).split()
+
+    def test_opens_a_release_pr(self):
+        result = self.prepare()
+        self.assertEqual(result["status"], "opened")
+        sha = self.remote("refs/heads/release/v13.3.0")[0]
+        self.assertEqual(sh(["git", "show", f"{sha}:VERSION"], self.origin), "13.3.0\n")
+        self.assertEqual(sh(["git", "log", "-1", "--format=%an %s", sha], self.origin).strip(),
+                         f"{BOT} Release v13.3.0")
+        create = next(c for c in self.gh_calls if c[:2] == ["pr", "create"])
+        marker = t.read_marker(create[create.index("--body") + 1])
+        self.assertEqual((marker["major"], marker["head_sha"]), (False, sha))
+        self.assertIn(["api", "-X", "POST", "repos/smileidentity/smileid-sdk-go/pulls/9/requested_reviewers",
+                       "-f", "reviewers[]=alice"], self.gh_calls)
+
+    def test_bump_script_and_its_git_config_stay_in_the_bump_job(self):
+        # The script plants a clean filter and a proxy in .git/config. They stay in
+        # the bump job's clone; the publish job's clone never sees them.
+        leak = self.tmp / "leak.txt"
+        stealer = self.tmp / "steal.sh"
+        stealer.write_text(f'echo "${{WRITE_TOKEN:-}}${{GH_TOKEN:-}}" >> {leak}\ncat\n')
+        (self.seed / "scripts" / "bump-version.sh").write_text(BUMP_SCRIPT.replace(
+            'echo "$1"',
+            f'git config filter.steal.clean "sh {stealer}"\n'
+            'git config http.proxy http://127.0.0.1:9\n'
+            'echo "* filter=steal" > .gitattributes\n'
+            'echo "$1"'))
+        self.push_seed("evil")
+        with mock.patch.dict(os.environ, {"WRITE_TOKEN": "secret-write", "GH_TOKEN": "secret-gh"}):
+            self.prepare()
+        # The filter ran in the bump job's git, without the job's environment.
+        self.assertTrue(leak.exists())
+        self.assertNotIn("secret", leak.read_text())
+        config = sh(["git", "config", "--list", "--local"], self.tmp / "work")
+        self.assertNotIn("steal", config)
+        self.assertNotIn("http.proxy", config)
+
+    def test_bump_script_runs_without_the_job_environment(self):
+        (self.seed / "scripts" / "bump-version.sh").write_text(BUMP_SCRIPT.replace(
+            'echo "$1"', 'env > seen-env.txt\necho "$1"'))
+        self.push_seed("env")
+        with mock.patch.dict(os.environ, {"READ_TOKEN": "secret-read", "GH_TOKEN": "secret-gh"}):
+            bundle = self.bump_job()
+        patch = (bundle / "patch.diff").read_text()
+        self.assertIn("seen-env.txt", patch)
+        self.assertNotIn("secret", patch)
+        self.assertIn("BUMP_DATE=2026-11-25", patch)
 
     def test_bump_failure_is_reported(self):
-        u = {"repo": "smileid-sdk-go", "version": "13.3.0", "part": "minor", "current": "13.2.0", "breaking_prs": []}
+        (self.seed / "scripts" / "bump-version.sh").write_text(
+            "#!/usr/bin/env bash\necho 'nothing unreleased' >&2\nexit 1\n")
+        self.push_seed("fail")
+        with self.assertRaisesRegex(t.TrainError, "nothing unreleased"):
+            self.bump_job()
 
-        def fake_run(cmd, check=True, **kwargs):
-            if "bump-version.sh" in " ".join(cmd):
-                return (1, "", "nothing unreleased")
-            return "x\n" if check else (0, "", "")
+    def test_leaves_an_up_to_date_pr_alone(self):
+        bundle = self.bump_job()
+        head = self.remote("refs/heads/main")[0]
+        self.open_prs = [dict(release_pr(5, "13.3.0"), body=t.write_marker({"version": "13.3.0", "base_sha": head}))]
+        self.assertEqual(self.publish_job(bundle)["status"], "unchanged")
+        self.assertEqual(self.remote("refs/heads/release/v13.3.0"), [])
 
-        with mock.patch.object(t, "run", fake_run), mock.patch.object(t, "open_release_prs", lambda r, tok, bot: []):
-            with self.assertRaisesRegex(t.TrainError, "nothing unreleased"):
-                t.prepare(u=u, workdir="/tmp/x", token="tok", bot_name=BOT, bot_email="e", run_url=RUN,
-                          reviewers=[], today="2026-11-25")
+    def test_updates_its_own_open_pr(self):
+        sh(["git", "checkout", "-qb", "release/v13.3.0"], self.seed)
+        (self.seed / "VERSION").write_text("13.3.0 old\n")
+        self.push_seed("older", author=BOT, branch="release/v13.3.0")
+        ours = self.remote("refs/heads/release/v13.3.0")[0]
+        self.open_prs = [dict(release_pr(5, "13.3.0"), headRefOid=ours,
+                              body=t.write_marker({"version": "13.3.0", "base_sha": "old", "head_sha": ours}))]
+        sh(["git", "checkout", "-q", "main"], self.seed)
+        self.assertEqual(self.prepare()["status"], "updated")
+        sha = self.remote("refs/heads/release/v13.3.0")[0]
+        self.assertEqual(sh(["git", "show", f"{sha}:VERSION"], self.origin), "13.3.0\n")
 
-    def test_bump_script_gets_no_token(self):
-        u = {"repo": "smileid-sdk-go", "version": "13.3.0", "part": "minor", "current": "13.2.0", "breaking_prs": []}
-        seen = {}
+    def test_never_throws_away_a_persons_commit_on_its_own_pr(self):
+        sh(["git", "checkout", "-qb", "release/v13.3.0"], self.seed)
+        (self.seed / "VERSION").write_text("13.3.0 fixed by hand\n")
+        self.push_seed("a person's fix", author="alice", branch="release/v13.3.0")
+        theirs = self.remote("refs/heads/release/v13.3.0")[0]
+        self.open_prs = [dict(release_pr(5, "13.3.0"), headRefOid=theirs,
+                              body=t.write_marker({"version": "13.3.0", "base_sha": "old", "head_sha": "a" * 40}))]
+        sh(["git", "checkout", "-q", "main"], self.seed)
+        with self.assertRaisesRegex(t.TrainError, "commits the release train didn't push"):
+            self.prepare()
+        self.assertEqual(self.remote("refs/heads/release/v13.3.0")[0], theirs)
 
-        def fake_run(cmd, check=True, env=None, inherit_env=True, **kwargs):
-            if "bump-version.sh" in " ".join(cmd):
-                seen.update(env or {})
-                seen["inherit_env"] = inherit_env
-                return (0, "13.3.0\n", "")
-            if cmd[:2] == ["gh", "pr"] and "create" in cmd:
-                return "https://github.com/smileidentity/smileid-sdk-go/pull/9\n"
-            return "main\n" if check else (0, "", "")
+    def test_never_pushes_over_a_persons_release_pr(self):
+        self.head_prs = [dict(release_pr(4, "13.3.0", author="mallory"), isCrossRepository=False)]
+        with self.assertRaisesRegex(t.TrainError, "mallory opened it, not the release train"):
+            self.prepare()
+        self.assertFalse(any(c[:2] == ["pr", "create"] for c in self.gh_calls))
 
-        with mock.patch.object(t, "run", fake_run), mock.patch.object(t, "open_release_prs", lambda r, tok, bot: []):
-            result = t.prepare(u=u, workdir="/tmp/x", token="tok", bot_name=BOT, bot_email="e", run_url=RUN,
-                               reviewers=["alice"], today="2026-11-25")
-        self.assertEqual(result["status"], "opened")
-        self.assertIs(seen["inherit_env"], False)
-        self.assertFalse([k for k in seen if "TOKEN" in k or k.startswith("GIT_CONFIG")])
+    def test_never_pushes_over_a_branch_without_a_train_pr(self):
+        # Even a commit whose author name is the bot's: anyone can set that.
+        for author in ("mallory", BOT):
+            with self.subTest(author=author):
+                sh(["git", "checkout", "-qB", "release/v13.3.0", "main"], self.seed)
+                (self.seed / "VERSION").write_text(f"13.3.0 {author}\n")
+                self.push_seed("by hand", author=author, branch="release/v13.3.0")
+                theirs = self.remote("refs/heads/release/v13.3.0")[0]
+                sh(["git", "checkout", "-q", "main"], self.seed)
+                with self.assertRaisesRegex(t.TrainError, "no open release train PR uses"):
+                    self.prepare()
+                self.assertEqual(self.remote("refs/heads/release/v13.3.0")[0], theirs)
+
+    def test_removes_its_branch_when_the_pr_cant_be_opened(self):
+        original = self.fake_gh
+
+        def failing(args, token, check=True, **kwargs):
+            if args[:2] == ["pr", "create"]:
+                raise t.TrainError("gh pr create failed (1): boom")
+            return original(args, token, check=check, **kwargs)
+
+        self.fake_gh = failing
+        with self.assertRaisesRegex(t.TrainError, "boom"):
+            self.prepare()
+        self.assertEqual(self.remote("refs/heads/release/v13.3.0"), [])
+
+    def test_refuses_when_main_moved_after_the_bump(self):
+        bundle = self.bump_job()
+        (self.seed / "other.txt").write_text("new\n")
+        self.push_seed("main moves")
+        with self.assertRaisesRegex(t.TrainError, "moved after the bump job ran"):
+            self.publish_job(bundle)
+        self.assertEqual(self.remote("refs/heads/release/v13.3.0"), [])
+
+    def test_refuses_a_patch_that_changes_workflows(self):
+        (self.seed / "scripts" / "bump-version.sh").write_text(BUMP_SCRIPT.replace(
+            'echo "$1"', 'mkdir -p .github/workflows && echo x > .github/workflows/evil.yml\necho "$1"'))
+        self.push_seed("evil")
+        with self.assertRaisesRegex(t.TrainError, r"\.github/workflows/evil\.yml, which a release must not change"):
+            self.prepare()
+        self.assertEqual(self.remote("refs/heads/release/v13.3.0"), [])
+
+    def test_refuses_workflow_changes_under_any_name(self):
+        for name in (".github/wörk.yml", ".github/my workflow.yml", '.github/a"b.yml'):
+            with self.subTest(name=name):
+                self.seed_script(f'mkdir -p .github && echo x > {json.dumps(name)}\necho "$1"')
+                with self.assertRaisesRegex(t.TrainError, "which a release must not change"):
+                    self.prepare()
+                self.assertEqual(self.remote("refs/heads/release/v13.3.0"), [])
+
+    def test_notes_come_from_the_publish_jobs_own_clone(self):
+        bundle = self.bump_job()
+        meta = json.loads((bundle / "meta.json").read_text())
+        (bundle / "meta.json").write_text(json.dumps(dict(meta, notes="<!-- release-train-state: {} -->")))
+        self.publish_job(bundle)
+        create = next(c for c in self.gh_calls if c[:2] == ["pr", "create"])
+        body = create[create.index("--body") + 1]
+        self.assertNotIn("<!-- release-train-state: {} -->", body)
+        self.assertIn("Added entry.", body)
+
+    def test_puts_the_old_commit_back_when_the_pr_cant_be_updated(self):
+        sh(["git", "checkout", "-qb", "release/v13.3.0"], self.seed)
+        (self.seed / "VERSION").write_text("13.3.0 old\n")
+        self.push_seed("older", author=BOT, branch="release/v13.3.0")
+        ours = self.remote("refs/heads/release/v13.3.0")[0]
+        self.open_prs = [dict(release_pr(5, "13.3.0"), headRefOid=ours,
+                              body=t.write_marker({"version": "13.3.0", "base_sha": "old", "head_sha": ours}))]
+        sh(["git", "checkout", "-q", "main"], self.seed)
+        original = self.fake_gh
+
+        def failing(args, token, check=True, **kwargs):
+            if args[:2] == ["pr", "edit"]:
+                raise t.TrainError("gh pr edit failed (1): boom")
+            return original(args, token, check=check, **kwargs)
+
+        self.fake_gh = failing
+        with self.assertRaisesRegex(t.TrainError, "boom"):
+            self.prepare()
+        self.assertEqual(self.remote("refs/heads/release/v13.3.0")[0], ours)
+
+    def test_runs_as_another_user_through_a_prefix(self):
+        # Stands in for "sudo -n -u bumper -- env -i -C <dir> ...": the prefix, not the
+        # caller, picks the directory and the environment.
+        wrapper = self.tmp / "as-other-user.sh"
+        wrapper.write_text('cd "$1" && shift && exec env -i PATH=/usr/bin:/bin:/usr/local/bin "$@"\n')
+        clone = self.tmp / "other"
+        t.clone_sdk("smileid-sdk-go", str(clone))
+        out = self.tmp / "out"
+        with mock.patch.dict(os.environ, {"WRITE_TOKEN": "secret"}):
+            t.make_patch(u=self.unit, workdir=str(clone), out=str(out), today="2026-11-25",
+                         runas=("sh", str(wrapper), str(clone)))
+        self.assertIn("+13.3.0", (out / "patch.diff").read_text())
+        self.assertNotIn("notes", json.loads((out / "meta.json").read_text()))
+
+    def seed_script(self, body):
+        (self.seed / "scripts" / "bump-version.sh").write_text(BUMP_SCRIPT.replace('echo "$1"', body))
+        self.push_seed("script")
+
+    def test_refuses_a_bundle_for_another_release(self):
+        bundle = self.bump_job()
+        meta = json.loads((bundle / "meta.json").read_text())
+        (bundle / "meta.json").write_text(json.dumps(dict(meta, version="13.4.0")))
+        with self.assertRaisesRegex(t.TrainError, "for another release"):
+            self.publish_job(bundle)
 
     def test_clean_environment_drops_tokens(self):
         with mock.patch.dict(t.os.environ, {"WRITE_TOKEN": "secret", "GH_TOKEN": "secret", "PATH": "/usr/bin:/bin"}):
@@ -478,7 +824,31 @@ class WorkflowTest(unittest.TestCase):
 
     def test_failed_runs_are_reported(self):
         self.assertIn("uses: ./.github/workflows/scheduled-run-status.yml", WORKFLOW)
-        self.assertIn("needs: [plan, prepare, land]", WORKFLOW)
+        self.assertIn("needs: [plan, bump, publish, land]", WORKFLOW)
+
+    def job(self, name):
+        start = WORKFLOW.index(f"\n  {name}:\n")
+        following = re.search(r"\n  [a-z]+:\n", WORKFLOW[start + 1:])
+        return WORKFLOW[start:start + 1 + following.start()] if following else WORKFLOW[start:]
+
+    def test_the_bump_job_holds_no_write_secrets(self):
+        bump = self.job("bump")
+        self.assertIn("permissions: {}", bump)
+        for secret in ("SMILE_GHA_BOT", "SPEC_SYNC_BUNDLE_KEY", "WRITE_TOKEN", "GH_TOKEN", "id-token"):
+            self.assertNotIn(secret, bump)
+        self.assertLess(bump.index("remove root access"), bump.index("release_train.py bump"))
+        self.assertIn("--run-as bumper", bump)
+        self.assertIn("ALL=(bumper) NOPASSWD: ALL", bump)
+
+    def test_the_publish_job_never_runs_sdk_code(self):
+        publish = self.job("publish")
+        self.assertNotIn("bump-version", publish)
+        self.assertNotIn("release_train.py bump", publish)
+
+    def test_the_bundle_cert_matches_spec_sync(self):
+        spec = (ROOT / ".github" / "workflows" / "sdk-spec-sync.yml").read_text()
+        cert = re.compile(r"-----BEGIN CERTIFICATE-----.*?-----END CERTIFICATE-----", re.S)
+        self.assertEqual(cert.findall(WORKFLOW), cert.findall(spec)[:1])
 
     def test_one_run_at_a_time(self):
         self.assertIn("group: sdk-release-train", WORKFLOW)

@@ -8,7 +8,9 @@ nothing to release skip that number.
 
 Subcommands:
   plan     work out which SDKs are due a release, and the shared version
-  prepare  run the SDK's bump script and open or update its release PR
+  clone    clone an SDK for the bump job (the only step there with a token, read-only)
+  bump     run the SDK's bump script with no token and write the change as a patch
+  publish  apply the patch to a fresh clone, push it and open or update the release PR
   land     merge an approved, green batch of release PRs, then tag every
            merged release PR that has no tag yet
 
@@ -245,15 +247,24 @@ def plan(sdks, *, cadences, today, daily_run, manual, repos=""):
     """Choose the SDKs to release and the shared version.
 
     sdks maps each repository to {"tags": [...], "changelog": text,
-    "breaking_prs": [...]}; a repository that couldn't be read is missing.
-    Returns {"version", "part", "units": [...], "skipped": {repo: reason}}.
+    "breaking_prs": [...], "open_versions": [...]}; open_versions are the
+    versions of the train's open release PRs. A repository that couldn't be
+    read is missing. Returns {"version", "part", "units": [...], "skipped": {repo: reason}}.
+
+    While a batch is still landing, its version is the one to build on: an SDK
+    whose PR in it is still open is planned at that version again, so a merge
+    and tag in one SDK doesn't push the others up a whole version.
     """
     chosen = select_repos(repos) if manual else list(SDK_REPOS)
     current = [v for v in (latest_release(info["tags"]) for info in sdks.values()) if v]
     if not current:
         raise TrainError("No SDK has a vX.Y.Z release tag, so there is no version to build on")
-    base = max(current, key=parse_version)
-    units, parts, skipped = [], [], {}
+    landing = landing_version(sdks)
+    # A tag at the landing version comes from that batch, so it doesn't move the base.
+    # (No tag is above it: landing_version ignores a batch something has gone past.)
+    below = [v for v in current if not landing or parse_version(v) < parse_version(landing)]
+    base = max(below or current, key=parse_version)
+    units, parts, needs, skipped = [], [], [], {}
     for repo in SDK_REPOS:
         if repo not in chosen:
             continue
@@ -270,19 +281,48 @@ def plan(sdks, *, cadences, today, daily_run, manual, repos=""):
         if part is None:
             skipped[repo] = "nothing under Unreleased"
             continue
+        mine = latest_release(info["tags"])
+        # An SDK that already released the landing batch builds on that release,
+        # so new changes in it move the batch on rather than joining it.
+        if landing and not mine:
+            # An SDK with no release yet can take any version, so it joins the landing batch.
+            needs.append(landing)
+        else:
+            own_base = mine if mine and landing and parse_version(mine) >= parse_version(landing) else base
+            needs.append(bump(own_base, part))
         parts.append(part)
-        units.append({"repo": repo, "part": part, "current": latest_release(info["tags"]),
-                      "breaking_prs": info["breaking_prs"]})
+        units.append({"repo": repo, "part": part, "current": mine, "breaking_prs": info["breaking_prs"]})
     if not units:
         return {"version": "", "part": "", "units": [], "skipped": skipped}
     part = highest_part(parts)
-    version = bump(base, part)
+    version = max(needs, key=parse_version)
+    # Join the landing batch when its version covers what every SDK here needs.
+    if landing and parse_version(landing) >= parse_version(version):
+        version = landing
     for u in units:
         u["version"] = version
     return {"version": version, "part": part, "units": units, "skipped": skipped}
 
 
-def fetch_sdk(repo, token):
+def landing_version(sdks):
+    """The version of a batch that is still landing, or None.
+
+    That is the newest open train PR version that its own SDK hasn't released,
+    and that no SDK has gone past. A PR left open below a released version
+    belongs to a batch that was overtaken, so it doesn't count.
+    """
+    tags = [v for v in (latest_release(info["tags"]) for info in sdks.values()) if v]
+    highest = max(tags, key=parse_version) if tags else None
+    found = []
+    for info in sdks.values():
+        mine = latest_release(info["tags"])
+        found += [v for v in info.get("open_versions", [])
+                  if VERSION_RE.match(v) and (not mine or parse_version(v) > parse_version(mine))
+                  and (not highest or parse_version(v) >= parse_version(highest))]
+    return max(found, key=parse_version) if found else None
+
+
+def fetch_sdk(repo, token, bot):
     """Tags, CHANGELOG.md on the default branch, and breaking PRs since the last tag."""
     tags = [line.split("refs/tags/", 1)[1] for line in
             run(["git", "ls-remote", "--tags", "--refs", f"{GIT_BASE}/{ORG}/{repo}.git"],
@@ -299,7 +339,8 @@ def fetch_sdk(repo, token):
                                "--search", f"merged:>{since}", "--json", "number,title,url", "--limit", "100"], token)
                            or "[]")
         breaking = [{"number": p["number"], "title": p["title"], "url": p["url"]} for p in found]
-    return {"tags": tags, "changelog": changelog, "breaking_prs": breaking}
+    open_versions = [pr_version(pr) for pr in open_release_prs(repo, token, bot) if pr_version(pr)]
+    return {"tags": tags, "changelog": changelog, "breaking_prs": breaking, "open_versions": open_versions}
 
 
 # ---------------------------------------------------------------------------
@@ -307,11 +348,16 @@ def fetch_sdk(repo, token):
 
 
 def read_marker(body):
-    match = re.search(rf"<!-- {MARKER}: (.*?) -->", body or "")
-    if not match:
+    """The state the train wrote at the end of a PR description.
+
+    Only the last marker counts: the description includes changelog notes, and
+    a marker inside them must not override the train's own.
+    """
+    found = re.findall(rf"<!-- {MARKER}: (.*?) -->", body or "")
+    if not found:
         return {}
     try:
-        value = json.loads(match.group(1))
+        value = json.loads(found[-1])
     except json.JSONDecodeError:
         return {}
     return value if isinstance(value, dict) else {}
@@ -325,8 +371,17 @@ def release_title(version):
     return f"Release v{version}"
 
 
-def render_pr_body(*, u, notes, base_sha, run_url):
-    major = u["part"] == "major"
+def is_major_for(version, current):
+    """Whether version is a new major for an SDK whose last release is current.
+
+    An SDK with no release yet isn't judged here: its first release can't break
+    anyone, and it mustn't hold back a batch.
+    """
+    return bool(current) and parse_version(version)[0] > parse_version(current)[0]
+
+
+def render_pr_body(*, u, notes, base_sha, run_url, head_sha=""):
+    major = is_major_for(u["version"], u.get("current"))
     lines = [
         f"Releases v{u['version']} of this SDK. All SDKs with unreleased changes release at v{u['version']} together.",
         "",
@@ -352,7 +407,7 @@ def render_pr_body(*, u, notes, base_sha, run_url):
         "## Version",
         "",
         f"- Last release: v{u['current']}" if u.get("current") else "- Last release: none",
-        f"- This SDK needs a {u['part']} release.",
+        f"- This SDK's changes need a {u['part']} release.",
     ]
     if u.get("breaking_prs"):
         lines.append("- Pull requests labelled breaking since the last release:")
@@ -361,7 +416,7 @@ def render_pr_body(*, u, notes, base_sha, run_url):
     lines += [
         f"Made by the [release train]({run_url}).",
         "",
-        write_marker({"version": u["version"], "base_sha": base_sha}),
+        write_marker({"version": u["version"], "base_sha": base_sha, "head_sha": head_sha, "major": major}),
     ]
     return "\n".join(lines)
 
@@ -388,50 +443,150 @@ def open_release_prs(repo, token, bot):
             and by_train(pr, bot)]
 
 
-def prepare(*, u, workdir, token, bot_name, bot_email, run_url, reviewers, today):
-    """Run the SDK's bump script at the shared version and open or update its release PR.
+def clone_sdk(repo, workdir, token=""):
+    """Clone the SDK's default branch. The token is passed in the environment, never stored in .git/config."""
+    git(["clone", "--quiet", f"{GIT_BASE}/{ORG}/{repo}.git", workdir], cwd=None, token=token)
 
-    Leaves an open release PR alone when it is already at this version and built
-    on the current default branch, so its approvals are kept.
+
+def make_patch(*, u, workdir, out, today, runas=()):
+    """Run the SDK's bump script in its clone and write the change as a patch, for the publish job.
+
+    This runs in the bump job, which holds no write token: the script is the
+    SDK's own code, and could do anything the job can. It runs without the
+    job's environment, and so does every git command after it, because the
+    script could have changed .git/config. Writes out/patch.diff and
+    out/meta.json.
+
+    runas is a command prefix, such as sudo -n -u <user> env -i ..., that runs
+    the script and every git command as an unprivileged user of their own. In
+    the workflow that user can't read the job's processes or files, and all its
+    processes are killed before anything else in the job runs.
+    """
+    repo, version = u["repo"], u["version"]
+    prefix = list(runas)
+    # With a prefix, its env -C changes directory as the other user, who may own a home this user can't enter.
+    where = None if prefix else workdir
+    base_sha = run([*prefix, "git", *GIT_SAFE, "rev-parse", "HEAD"], cwd=where, inherit_env=False).strip()
+    dates = {"BUMP_DATE": today, "RELEASE_DATE": today, "BUMP_VERSION_DATE": today}
+    if prefix:
+        # env -i in the prefix clears the environment, so pass the dates as arguments to it.
+        command = [*prefix, *(f"{k}={v}" for k, v in dates.items()), "bash", "scripts/bump-version.sh", version]
+        dates = {}
+    else:
+        command = ["bash", "scripts/bump-version.sh", version]
+    code, stdout, err = run(command, cwd=where, env=dates, check=False, inherit_env=False)
+    if code != 0:
+        raise TrainError(f"{repo}: scripts/bump-version.sh {version} failed: {(err or stdout).strip()[-1500:]}")
+    printed = (stdout or "").strip().splitlines()[-1:] or [""]
+    if printed[0].strip() != version:
+        raise TrainError(f"{repo}: scripts/bump-version.sh printed {printed[0]!r}, not {version}")
+    run([*prefix, "git", *GIT_SAFE, "add", "--all"], cwd=where, inherit_env=False)
+    patch = run([*prefix, "git", *GIT_SAFE, "diff", "--cached", "--binary", "--no-ext-diff", "--no-textconv"],
+                cwd=where, inherit_env=False)
+    if not patch.strip():
+        raise TrainError(f"{repo}: scripts/bump-version.sh {version} changed nothing")
+    os.makedirs(out, exist_ok=True)
+    with open(os.path.join(out, "patch.diff"), "w", encoding="utf-8") as f:
+        f.write(patch)
+    with open(os.path.join(out, "meta.json"), "w", encoding="utf-8") as f:
+        json.dump({"repo": repo, "version": version, "base_sha": base_sha}, f)
+
+
+SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+
+
+def read_bundle(bundle, u):
+    """Read and check the bump job's patch and meta.json."""
+    try:
+        with open(os.path.join(bundle, "meta.json"), encoding="utf-8") as f:
+            meta = json.load(f)
+        with open(os.path.join(bundle, "patch.diff"), encoding="utf-8") as f:
+            patch = f.read()
+    except (OSError, ValueError) as e:
+        raise TrainError(f"{u['repo']}: the bump job's bundle is missing or unreadable, so nothing was pushed: {e}")
+    if not isinstance(meta, dict) or (meta.get("repo"), meta.get("version")) != (u["repo"], u["version"]):
+        raise TrainError(f"{u['repo']}: the bump job's bundle is for another release, so nothing was pushed")
+    if not SHA_RE.match(str(meta.get("base_sha", ""))):
+        raise TrainError(f"{u['repo']}: the bump job's bundle has no valid base commit, so nothing was pushed")
+    return meta, patch
+
+
+def publish(*, u, bundle, workdir, token, bot_name, bot_email, run_url, reviewers):
+    """Apply the bump job's patch to a fresh clone, push it and open or update the release PR.
+
+    This job holds the write token, so it never runs the SDK's code: only git
+    and gh, on a clone whose .git/config nothing else has touched. Leaves an
+    open release PR alone when it is already at this version and built on the
+    current default branch, so its approvals are kept.
     """
     repo, version = u["repo"], u["version"]
     full = f"{ORG}/{repo}"
     branch = f"{BRANCH_PREFIX}{version}"
-    git(["clone", "--quiet", f"{GIT_BASE}/{full}.git", workdir], cwd=None, token=token)
+    meta, patch = read_bundle(bundle, u)
+    clone_sdk(repo, workdir, token)
     base_sha = git(["rev-parse", "HEAD"], cwd=workdir).strip()
+    if base_sha != meta["base_sha"]:
+        raise TrainError(f"{repo}: the default branch moved after the bump job ran, so nothing was pushed. "
+                         "The next run bumps it again.")
     existing = open_release_prs(repo, token, bot_name)
-    for pr in existing:
-        marker = read_marker(pr.get("body"))
-        if pr["headRefName"] == branch and marker.get("base_sha") == base_sha and marker.get("version") == version:
-            print(f"{pr['url']} is already v{version} on the current {repo} main; left alone.")
-            return {"repo": repo, "status": "unchanged", "url": pr["url"]}
-
-    notes = unreleased(git(["show", "HEAD:CHANGELOG.md"], cwd=workdir))
-    git(["checkout", "--quiet", "-B", branch], cwd=workdir)
-    # The bump script is the SDK's own, from its default branch. It runs without
-    # the job's environment, so it can't read WRITE_TOKEN, GH_TOKEN or any other token.
-    code, out, err = run(["bash", "scripts/bump-version.sh", version], cwd=workdir,
-                         env={"BUMP_DATE": today, "RELEASE_DATE": today, "BUMP_VERSION_DATE": today},
-                         check=False, inherit_env=False)
-    if code != 0:
-        raise TrainError(f"{repo}: scripts/bump-version.sh {version} failed: {(err or out).strip()[-1500:]}")
-    printed = (out or "").strip().splitlines()[-1:] or [""]
-    if printed[0].strip() != version:
-        raise TrainError(f"{repo}: scripts/bump-version.sh printed {printed[0]!r}, not {version}")
-    git(["add", "--all"], cwd=workdir)
-    git(["-c", f"user.name={bot_name}", "-c", f"user.email={bot_email}", "commit", "--quiet", "-m",
-         f"Release v{version}"], cwd=workdir)
-    git(["push", "--quiet", "--force", "origin", f"HEAD:refs/heads/{branch}"], cwd=workdir, token=token)
-
-    body = render_pr_body(u=u, notes=notes, base_sha=base_sha, run_url=run_url)
     current = next((pr for pr in existing if pr["headRefName"] == branch), None)
     if current:
-        gh(["pr", "edit", str(current["number"]), "--repo", full, "--title", release_title(version), "--body", body],
-           token)
+        marker = read_marker(current.get("body"))
+        if marker.get("base_sha") == base_sha and marker.get("version") == version:
+            print(f"{current['url']} is already v{version} on the current {repo} main; left alone.")
+            return {"repo": repo, "status": "unchanged", "url": current["url"]}
+        # Someone pushed to the train's branch: don't throw their commit away.
+        if current.get("headRefOid") != marker.get("head_sha"):
+            raise TrainError(f"{current['url']} has commits the release train didn't push, so it wasn't rebuilt. "
+                             "Close the PR, or reset its branch, and the next run carries on.")
+    check_branch_is_ours(repo, branch, workdir, token, bot_name, existing)
+    # The notes come from this job's own clone, never from the bundle.
+    notes = unreleased(git(["show", "HEAD:CHANGELOG.md"], cwd=workdir))
+    if current:
+        # Keep the PR's current commit, to put back if the PR can't be updated.
+        git(["fetch", "--quiet", "origin", f"refs/heads/{branch}"], cwd=workdir, token=token)
+
+    git(["checkout", "--quiet", "-B", branch], cwd=workdir)
+    git(["apply", "--index", "--binary", "-"], cwd=workdir, input_text=patch)
+    # Raw paths: git quotes unusual names unless told not to, and a quoted
+    # ".github/..." wouldn't start with ".github/".
+    touched = [path for path in git(["-c", "core.quotePath=false", "diff", "--cached", "--no-renames",
+                                     "--name-only", "-z"], cwd=workdir).split("\0") if path]
+    bad = [path for path in touched if path.startswith(".github/") or path == ".gitmodules"]
+    if bad:
+        raise TrainError(f"{repo}: the bump changed {', '.join(bad)}, which a release must not change, so nothing "
+                         "was pushed")
+    git(["-c", f"user.name={bot_name}", "-c", f"user.email={bot_email}", "commit", "--quiet", "-m",
+         f"Release v{version}"], cwd=workdir)
+    head_sha = git(["rev-parse", "HEAD"], cwd=workdir).strip()
+    git(["push", "--quiet", "--force", "origin", f"HEAD:refs/heads/{branch}"], cwd=workdir, token=token)
+
+    body = render_pr_body(u=u, notes=notes, base_sha=base_sha, head_sha=head_sha, run_url=run_url)
+    if current:
+        try:
+            gh(["pr", "edit", str(current["number"]), "--repo", full, "--title", release_title(version), "--body",
+                body], token)
+        except TrainError as e:
+            # The marker would no longer match the branch, and later runs would refuse the PR: put the old commit back.
+            code, _, err = git(["push", "--quiet", "--force", "origin", f"{current['headRefOid']}:refs/heads/{branch}"],
+                               cwd=workdir, token=token, check=False)
+            if code != 0:
+                raise TrainError(f"{e} The PR's branch now has a commit its description doesn't record, so later "
+                                 f"runs will refuse it: close {current['url']}. ({err.strip()[-300:]})") from e
+            raise
         url, status = current["url"], "updated"
     else:
-        url = gh(["pr", "create", "--repo", full, "--base", default_branch(repo, token), "--head", branch,
-                  "--title", release_title(version), "--body", body, "--label", LABEL], token).strip()
+        try:
+            url = gh(["pr", "create", "--repo", full, "--base", default_branch(repo, token), "--head", branch,
+                      "--title", release_title(version), "--body", body, "--label", LABEL], token).strip()
+        except TrainError as e:
+            # Without a PR, the branch would block the next run: remove it.
+            code, _, err = git(["push", "--quiet", "origin", "--delete", branch], cwd=workdir, token=token,
+                               check=False)
+            if code != 0:
+                raise TrainError(f"{e} The {branch} branch is still there and blocks the next run: delete it by "
+                                 f"hand. ({err.strip()[-300:]})") from e
+            raise
         status = "opened"
         number = url.rstrip("/").rsplit("/", 1)[-1]
         for reviewer in reviewers:
@@ -447,6 +602,28 @@ def prepare(*, u, workdir, token, bot_name, bot_email, run_url, reviewers, today
             print(f"Closed {pr['url']}: replaced by {url}")
     print(f"{status.capitalize()} {url}")
     return {"repo": repo, "status": status, "url": url}
+
+
+def check_branch_is_ours(repo, branch, workdir, token, bot, existing):
+    """Refuse to force-push over a branch a person uses.
+
+    The branch is ours only when one of the train's open PRs uses it, or when it
+    doesn't exist. A commit's author name proves nothing, since anyone can set
+    it, so any other existing branch stops the job. A run that pushes but then
+    can't open the PR deletes its branch, so it doesn't block the next run.
+    """
+    if any(pr["headRefName"] == branch for pr in existing):
+        return
+    out = gh(["pr", "list", "--repo", f"{ORG}/{repo}", "--head", branch, "--state", "open",
+              "--json", "url,isCrossRepository,author", "--limit", "20"], token)
+    for pr in json.loads(out or "[]"):
+        if not pr.get("isCrossRepository", True) and not by_train(pr, bot):
+            login = (pr.get("author") or {}).get("login") or "unknown"
+            raise TrainError(f"{pr['url']} uses {branch} and {login} opened it, not the release train, so nothing "
+                             "was pushed. Merge or close it, and the next run carries on.")
+    if git(["ls-remote", "origin", f"refs/heads/{branch}"], cwd=workdir, token=token).strip():
+        raise TrainError(f"{repo} already has a {branch} branch that no open release train PR uses, so nothing was "
+                         "pushed. Delete the branch if it isn't needed, and the next run carries on.")
 
 
 def default_branch(repo, token):
@@ -537,8 +714,10 @@ def land_batch(prs_by_repo, token, latest_versions, bot):
     urls = {repo: pr["url"] for repo, pr in batch.items()}
     waiting = {repo: blockers(pr, version, bot) for repo, pr in batch.items()}
     waiting = {repo: why for repo, why in waiting.items() if why}
-    base = max(latest_versions.values(), key=parse_version) if latest_versions else None
-    if base and parse_version(version)[0] > parse_version(base)[0]:
+    # Judge each SDK against its own last release: once a person merges one PR of a
+    # major batch and the train tags it, the others are still major for their SDKs.
+    if any(read_marker(pr.get("body")).get("major") or is_major_for(version, latest_versions.get(repo))
+           for repo, pr in batch.items()):
         print(f"::notice::v{version} is a major release, so the train won't merge it. Merge each PR yourself once "
               "it's approved; the train pushes the tags.")
         return {"version": version, "merged": [], "waiting": waiting, "major": True, "urls": urls}
@@ -678,8 +857,9 @@ def land(token, now, bot, repos=None):
             out = gh(["pr", "list", "--repo", f"{ORG}/{repo}", "--label", LABEL, "--state", "open", "--json",
                       "number,url,title,body,headRefName,headRefOid,isDraft,isCrossRepository,reviewDecision,"
                       "mergeStateStatus,statusCheckRollup,author", "--limit", "20"], token)
+            # A person's release PR, such as one cut by hand, never joins a batch.
             prs_by_repo[repo] = [pr for pr in json.loads(out or "[]") if not pr.get("isCrossRepository", True)
-                                 and pr_version(pr)]
+                                 and pr_version(pr) and by_train(pr, bot)]
             tags = [line.split("refs/tags/", 1)[1] for line in
                     run(["git", "ls-remote", "--tags", "--refs", f"{GIT_BASE}/{ORG}/{repo}.git"],
                         env=git_auth_env(token)).splitlines() if "refs/tags/" in line]
@@ -753,8 +933,17 @@ def main(argv=None):
     p.add_argument("--repos", default="")
     p.add_argument("--event", required=True, help="schedule or workflow_dispatch")
     p.add_argument("--daily-run", default="false")
-    p = sub.add_parser("prepare")
+    p = sub.add_parser("clone")
     p.add_argument("--unit", required=True)
+    p.add_argument("--workdir", required=True)
+    p = sub.add_parser("bump")
+    p.add_argument("--unit", required=True)
+    p.add_argument("--workdir", required=True)
+    p.add_argument("--out", required=True)
+    p.add_argument("--run-as", default="", help="unprivileged user to run the bump script as, through sudo")
+    p = sub.add_parser("publish")
+    p.add_argument("--unit", required=True)
+    p.add_argument("--bundle", required=True)
     p.add_argument("--workdir", required=True)
     p.add_argument("--bot-name", required=True)
     p.add_argument("--bot-email", required=True)
@@ -766,12 +955,16 @@ def main(argv=None):
     try:
         if args.command == "plan":
             token = os.environ.get("READ_TOKEN", "")
+            bot = os.environ.get("RELEASE_TRAIN_BOT", "")
+            if not bot.removesuffix("[bot]"):
+                raise TrainError("RELEASE_TRAIN_BOT has no app slug, so the plan can't tell which open release PRs "
+                                 "are the train's. Check the bot-slug step's app-slug output.")
             cadences = parse_cadence(args.cadence or "manual", args.overrides)
             manual = args.event == "workflow_dispatch"
             sdks = {}
             for repo in SDK_REPOS:
                 try:
-                    sdks[repo] = fetch_sdk(repo, token)
+                    sdks[repo] = fetch_sdk(repo, token, bot)
                 except TrainError as e:
                     print(f"::warning::Could not read {repo}, so it isn't released in this run: {e}")
             result = plan(sdks, cadences=cadences, today=now.date(), daily_run=args.daily_run == "true",
@@ -779,12 +972,27 @@ def main(argv=None):
             write_summary(render_plan_summary(result, cadences))
             write_output("has_work", "true" if result["units"] else "false")
             write_output("matrix", json.dumps({"include": result["units"]}, separators=(",", ":")))
-        elif args.command == "prepare":
+        elif args.command == "clone":
+            u = json.loads(args.unit)
+            clone_sdk(u["repo"], args.workdir, os.environ.get("READ_TOKEN", ""))
+        elif args.command == "bump":
+            runas = ()
+            if args.run_as:
+                home = f"/home/{args.run_as}"
+                runas = ("sudo", "-n", "-u", args.run_as, "--", "env", "-i", "-C", args.workdir, f"HOME={home}",
+                         f"TMPDIR={home}/tmp", "PATH=/usr/local/bin:/usr/bin:/bin", "LANG=C.UTF-8")
+            try:
+                make_patch(u=json.loads(args.unit), workdir=args.workdir, out=args.out,
+                           today=now.strftime("%Y-%m-%d"), runas=runas)
+            finally:
+                if args.run_as:
+                    # Nothing the script started may outlive this step.
+                    run(["sudo", "-n", "-u", args.run_as, "--", "kill", "-KILL", "-1"], check=False)
+        elif args.command == "publish":
             u = json.loads(args.unit)
             reviewers = [r.strip() for r in args.reviewers.split(",") if r.strip()]
-            prepare(u=u, workdir=args.workdir, token=os.environ["WRITE_TOKEN"], bot_name=args.bot_name,
-                    bot_email=args.bot_email, run_url=args.run_url, reviewers=reviewers,
-                    today=now.strftime("%Y-%m-%d"))
+            publish(u=u, bundle=args.bundle, workdir=args.workdir, token=os.environ["WRITE_TOKEN"],
+                    bot_name=args.bot_name, bot_email=args.bot_email, run_url=args.run_url, reviewers=reviewers)
         elif args.command == "land":
             bot = os.environ.get("RELEASE_TRAIN_BOT", "")
             if not bot.removesuffix("[bot]"):

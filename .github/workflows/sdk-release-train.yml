@@ -5,9 +5,11 @@ name: SDK release train
 # Once a day, the plan job finds the SDKs that are due a release under
 # SDK_RELEASE_CADENCE (and SDK_RELEASE_CADENCE_OVERRIDES) and have entries under
 # Unreleased in CHANGELOG.md. It picks one version for the run: the highest bump
-# those SDKs need, applied to the highest version any SDK has released. The
-# prepare jobs run each SDK's scripts/bump-version.sh at that version and open
-# or update one release PR per SDK.
+# those SDKs need, applied to the highest version any SDK has released, unless
+# a batch is still landing. The bump jobs run each SDK's
+# scripts/bump-version.sh at that version with no write token, and the publish
+# jobs, which never run SDK code, push the change and open or update one release
+# PR per SDK.
 #
 # Every hour, the land job merges the newest batch of release PRs once every PR
 # in it is approved and all its checks pass, and pushes a v* tag on each merged
@@ -62,10 +64,21 @@ jobs:
           repositories: smileid-sdk-go,smileid-sdk-java,smileid-sdk-js,smileid-sdk-php,smileid-sdk-python,smileid-sdk-ruby,smileid-sdk-rust
           permission-contents: read
           permission-pull-requests: read
+      # Only for SMILE_GHA_BOT's slug, so the plan knows which open release PRs are
+      # the train's. The token can only read pull requests, and nothing uses it.
+      - id: bot-slug
+        uses: actions/create-github-app-token@f418cff399f7aef4c2f0ad47e25ca7a6abbdd6fc # v3.4.0
+        with:
+          client-id: ${{ secrets.SMILE_GHA_BOT_CLIENT_ID }}
+          private-key: ${{ secrets.SMILE_GHA_BOT_PRIVATE_KEY }}
+          owner: smileidentity
+          repositories: smileid-sdk-go
+          permission-pull-requests: read
       - id: plan
         name: Plan the releases
         env:
           READ_TOKEN: ${{ steps.read-token.outputs.token }}
+          RELEASE_TRAIN_BOT: ${{ steps.bot-slug.outputs.app-slug }}[bot]
           CADENCE: ${{ vars.SDK_RELEASE_CADENCE }}
           OVERRIDES: ${{ vars.SDK_RELEASE_CADENCE_OVERRIDES }}
           REPOS: ${{ inputs.repos }}
@@ -75,10 +88,127 @@ jobs:
           python3 scripts/release_train/release_train.py plan --cadence "$CADENCE" --overrides "$OVERRIDES" \
             --repos "$REPOS" --event "$EVENT" --daily-run "$DAILY_RUN"
 
-  prepare:
+  # Runs each SDK's own bump script, so this job holds no write token, no
+  # bundle key and no root. Its only secret use is a read-only token for the
+  # clone, in a step before the script runs. It hands the change to the publish
+  # job as a patch, encrypted to BUNDLE_CERT because this repository's
+  # artifacts are public and smileid-sdk-rust is private.
+  bump:
     needs: plan
     if: needs.plan.outputs.has_work == 'true'
-    name: ${{ matrix.repo }} v${{ matrix.version }}
+    name: bump ${{ matrix.repo }} v${{ matrix.version }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions: {}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - id: read-token
+        uses: actions/create-github-app-token@f418cff399f7aef4c2f0ad47e25ca7a6abbdd6fc # v3.4.0
+        with:
+          client-id: ${{ secrets.SPEC_SYNC_READER_CLIENT_ID }}
+          private-key: ${{ secrets.SPEC_SYNC_READER_PRIVATE_KEY }}
+          owner: smileidentity
+          repositories: ${{ matrix.repo }}
+          permission-contents: read
+      - name: Clone the SDK
+        env:
+          UNIT: ${{ toJSON(matrix) }}
+          READ_TOKEN: ${{ steps.read-token.outputs.token }}
+        run: python3 scripts/release_train/release_train.py clone --unit "$UNIT" --workdir "$RUNNER_TEMP/sdk"
+      # The bump script runs as its own unprivileged user. It can't read this
+      # job's processes (and so the reader key or the artifact token), its files,
+      # or root; and every process it starts is killed before the next step.
+      - name: Set up a user for the SDK's code and remove root access
+        run: |
+          sudo useradd --create-home --shell /bin/bash bumper
+          sudo install -d -o bumper -g bumper -m 0700 /home/bumper/tmp
+          sudo cp -a "$RUNNER_TEMP/sdk" /home/bumper/sdk
+          sudo chown -R bumper:bumper /home/bumper/sdk
+          sudo chmod 0700 /home/bumper
+          sudo systemctl stop docker.socket docker.service containerd.service 2>/dev/null || true
+          sudo rm -f /var/run/docker.sock /run/containerd/containerd.sock
+          # One sudo call: the rule blocks sudo as soon as it is in place, so no sudo can follow it.
+          # sudoers.d skips file names with a dot, so the .tmp file has no effect until the mv.
+          # The last matching rule wins: root is refused, and only "sudo -u bumper" works.
+          sudo sh -c 'f=/etc/sudoers.d/zz-release-train-no-sudo; printf "%s ALL=(ALL) !ALL\n%s ALL=(bumper) NOPASSWD: ALL\n" "$1" "$1" > "$f.tmp" && chmod 0440 "$f.tmp" && visudo -cf "$f.tmp" && mv "$f.tmp" "$f"' sh "$(id -un)"
+          if sudo -n true 2>/dev/null; then
+            echo "::error::sudo still works as root, so the bump script could read the runner's secrets."
+            exit 1
+          fi
+          if ! sudo -n -u bumper true; then
+            echo "::error::Can't run commands as the bumper user."
+            exit 1
+          fi
+          if docker info > /dev/null 2>&1; then
+            echo "::error::Docker still runs, so the bump script could get root."
+            exit 1
+          fi
+          if [ "$(cat /proc/sys/kernel/yama/ptrace_scope 2>/dev/null || echo 0)" -lt 1 ]; then
+            echo "::error::kernel.yama.ptrace_scope is 0, so the bump script could read the runner's memory."
+            exit 1
+          fi
+
+      # No token is in this step's environment, and the script runs as bumper.
+      - name: Run the bump script and bundle the change
+        env:
+          UNIT: ${{ toJSON(matrix) }}
+          BUNDLE_CERT: |
+            -----BEGIN CERTIFICATE-----
+            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
+            FHw+YXMkDAd2/xkUDIU=
+            -----END CERTIFICATE-----
+        run: |
+          bundle="$RUNNER_TEMP/bundle"
+          python3 scripts/release_train/release_train.py bump --unit "$UNIT" --workdir /home/bumper/sdk \
+            --run-as bumper --out "$bundle"
+          printf '%s\n' "$BUNDLE_CERT" > "$RUNNER_TEMP/bundle-cert.pem"
+          (cd "$bundle" && tar -cf "$RUNNER_TEMP/bundle.tar" -- meta.json patch.diff)
+          mkdir -p "$RUNNER_TEMP/upload"
+          openssl cms -encrypt -binary -aes256 -outform DER -in "$RUNNER_TEMP/bundle.tar" \
+            -out "$RUNNER_TEMP/upload/bundle.cms" "$RUNNER_TEMP/bundle-cert.pem"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-train-bundle-${{ matrix.repo }}
+          path: ${{ runner.temp }}/upload/bundle.cms
+          retention-days: 3
+
+  # Holds the write token, so it never runs an SDK's code: it applies the bump
+  # job's patch to a fresh clone with git, pushes it and opens or updates the PR.
+  publish:
+    needs: [plan, bump]
+    if: ${{ !cancelled() && needs.plan.outputs.has_work == 'true' }}
+    name: publish ${{ matrix.repo }} v${{ matrix.version }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     strategy:
@@ -88,6 +218,27 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release-train-bundle-${{ matrix.repo }}
+          path: ${{ runner.temp }}/download
+      - name: Unpack the bundle
+        env:
+          BUNDLE_KEY: ${{ secrets.SPEC_SYNC_BUNDLE_KEY }}
+        run: |
+          key="$RUNNER_TEMP/bundle-key.pem"
+          (umask 077 && printf '%s\n' "$BUNDLE_KEY" > "$key")
+          openssl cms -decrypt -binary -inform DER -in "$RUNNER_TEMP/download/bundle.cms" -inkey "$key" \
+            -out "$RUNNER_TEMP/bundle.tar"
+          rm -f "$key"
+          # Exactly meta.json and patch.diff, as plain files.
+          if tar -tvf "$RUNNER_TEMP/bundle.tar" | grep -qv '^-' \
+            || [ "$(tar -tf "$RUNNER_TEMP/bundle.tar" | sort | tr '\n' ' ')" != "meta.json patch.diff " ]; then
+            echo "::error::The bundle holds something other than meta.json and patch.diff, so nothing was pushed."
+            exit 1
+          fi
+          mkdir -p "$RUNNER_TEMP/bundle"
+          tar -C "$RUNNER_TEMP/bundle" --no-same-owner --no-same-permissions -xf "$RUNNER_TEMP/bundle.tar"
       - id: write-token
         uses: actions/create-github-app-token@f418cff399f7aef4c2f0ad47e25ca7a6abbdd6fc # v3.4.0
         with:
@@ -107,13 +258,14 @@ jobs:
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           bot_id=$(gh api "/users/${BOT/\[bot\]/%5Bbot%5D}" --jq .id)
-          python3 scripts/release_train/release_train.py prepare --unit "$UNIT" --workdir "$RUNNER_TEMP/sdk" \
-            --bot-name "$BOT" --bot-email "$bot_id+$BOT@users.noreply.github.com" --run-url "$RUN_URL" \
-            --reviewers "$REVIEWERS"
+          python3 scripts/release_train/release_train.py publish --unit "$UNIT" --bundle "$RUNNER_TEMP/bundle" \
+            --workdir "$RUNNER_TEMP/sdk" --bot-name "$BOT" --bot-email "$bot_id+$BOT@users.noreply.github.com" \
+            --run-url "$RUN_URL" --reviewers "$REVIEWERS"
 
   land:
-    needs: [plan, prepare]
-    if: ${{ always() }}
+    needs: [plan, bump, publish]
+    # Runs after a skipped plan, bump or publish (the hourly runs), but not after someone cancels the run.
+    if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -151,7 +303,7 @@ jobs:
   # A failed run opens (or comments on) an issue here, and the next passing run
   # closes it. See "Report scheduled run status" in the README.
   report:
-    needs: [plan, prepare, land]
+    needs: [plan, bump, publish, land]
     if: ${{ !cancelled() }}
     permissions:
       issues: write
