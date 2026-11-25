@@ -304,6 +304,12 @@ jobs:
           # Install only; Claude runs it. Keep in step with smileid-sdk-go's test.yml.
           version: v2.14.0
           install-only: true
+      # scripts/coverage.sh needs gocover-cobertura to write coverage.xml for
+      # diff-cover. Claude runs in auto mode, which blocks it installing tools
+      # itself. Keep in step with smileid-sdk-go's quality-gates.yml.
+      - if: matrix.repo == 'smileid-sdk-go'
+        name: Install gocover-cobertura
+        run: go install github.com/boumenot/gocover-cobertura@v1.5.0
       - if: matrix.repo == 'smileid-sdk-java'
         uses: actions/setup-java@d1374f8ac74474200d16ef8ecee22c7ae7a51880 # v6.3.0
         with:
