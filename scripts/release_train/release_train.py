@@ -367,10 +367,15 @@ def render_pr_body(*, u, notes, base_sha, run_url):
 
 
 def by_train(pr, bot):
-    """Whether the train's bot opened the PR. gh shows a GitHub App author as app/<slug>."""
+    """Whether the train's bot opened the PR.
+
+    gh shows a GitHub App author as app/<slug> with is_bot set. Only that form
+    counts: the bare slug is how gh shows a user, and anyone could register a
+    user login equal to the app's slug.
+    """
     slug = (bot or "").removesuffix("[bot]")
-    login = (pr.get("author") or {}).get("login", "")
-    return bool(slug) and login in (bot, slug, f"app/{slug}")
+    author = pr.get("author") or {}
+    return bool(slug) and author.get("is_bot") is True and author.get("login") == f"app/{slug}"
 
 
 def open_release_prs(repo, token, bot):
@@ -782,9 +787,9 @@ def main(argv=None):
                     today=now.strftime("%Y-%m-%d"))
         elif args.command == "land":
             bot = os.environ.get("RELEASE_TRAIN_BOT", "")
-            if not bot:
-                print("::warning::RELEASE_TRAIN_BOT is not set, so no release PR counts as the train's own: "
-                      "nothing is merged or tagged.")
+            if not bot.removesuffix("[bot]"):
+                raise TrainError("RELEASE_TRAIN_BOT has no app slug, so no release PR would count as the train's "
+                                 "own. Check the write-token step's app-slug output.")
             report = land(os.environ["WRITE_TOKEN"], now, bot)
             lines = ["## Release train: merge and tag", ""]
             if report.get("version"):

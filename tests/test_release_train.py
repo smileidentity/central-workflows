@@ -256,10 +256,21 @@ class LandTest(unittest.TestCase):
         self.assertIn("app/smile-gha-bot opened it, not the release train", t.blockers(release_pr(1, "13.3.0"), "13.3.0", ""))
 
     def test_by_train(self):
-        for login in ("app/smile-gha-bot", "smile-gha-bot[bot]", "smile-gha-bot"):
-            self.assertTrue(t.by_train({"author": {"login": login}}, BOT), login)
-        self.assertFalse(t.by_train({"author": {"login": "app/other-bot"}}, BOT))
-        self.assertFalse(t.by_train({}, BOT))
+        self.assertTrue(t.by_train({"author": {"login": "app/smile-gha-bot", "is_bot": True}}, BOT))
+        # Only gh's form for an app counts. Anyone could register a user login equal to the slug.
+        for author in ({"login": "smile-gha-bot", "is_bot": False}, {"login": "app/smile-gha-bot", "is_bot": False},
+                       {"login": "app/smile-gha-bot"}, {"login": "smile-gha-bot[bot]", "is_bot": True},
+                       {"login": "app/other-bot", "is_bot": True}, {}):
+            self.assertFalse(t.by_train({"author": author}, BOT), author)
+        self.assertFalse(t.by_train({"author": {"login": "app/smile-gha-bot", "is_bot": True}}, "[bot]"))
+
+    def test_a_user_named_like_the_bot_cant_get_a_pr_merged(self):
+        prs = {"smileid-sdk-go": [release_pr(1, "13.3.0", author="smile-gha-bot")]}
+        fake = FakeGh()
+        with mock.patch.object(t, "gh", fake):
+            report = t.land_batch(prs, "tok", self.LATEST, BOT)
+        self.assertEqual(report["merged"], [])
+        self.assertEqual(fake.calls, [])
 
     def test_never_merges_a_major(self):
         prs = {"smileid-sdk-go": [release_pr(1, "14.0.0")]}
@@ -291,7 +302,7 @@ class TagTest(unittest.TestCase):
     def merged(self, number, version, merged_at="2026-11-25T06:00:00Z"):
         return {"number": number, "url": f"u{number}", "headRefName": f"release/v{version}",
                 "mergeCommit": {"oid": f"m{number}"}, "mergedAt": merged_at, "isCrossRepository": False,
-                "author": {"login": "app/smile-gha-bot"}}
+                "author": {"login": "app/smile-gha-bot", "is_bot": True}}
 
     def tag(self, prs, latest):
         calls = []
