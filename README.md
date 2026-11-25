@@ -7,6 +7,7 @@ Shared GitHub Actions workflows for Smile Identity's public and private reposito
 - `deploy-status.yml` records what each environment is running. After a deploy it updates a badge for that environment on the calling repository's `deploy-status` branch and, if given a Slack token and canvas, that environment's line on a shared Slack canvas.
 - `scheduled-run-status.yml` keeps one issue open while a scheduled workflow fails. A failed run opens the issue or comments on it, and the next passing run closes it. Given a Slack webhook, it posts each change to Slack too.
 - `sdk-spec-sync-record.yml` and `sdk-spec-sync.yml` keep the V3 server-side SDKs in step with the API spec. They run in this repository only; nothing calls them. See [Sync the SDKs with the API spec](#sync-the-sdks-with-the-api-spec).
+- `sdk-release-train.yml` releases the V3 SDKs at one shared version. It runs in this repository only. See [Release the SDKs](#release-the-sdks).
 - `merge-safety.yml` sorts each PR into a risk class from its changed files and author, and shows it as a `merge-safety/<class>` label and a job summary. It is advisory and always passes.
 
 `Check shared PR workflows` calls this repository's workflows too, pinned by commit SHA like any other caller. Update its pins when you update the distributed callers. It assigns PR authors and supports manual dry runs of stale handling.
@@ -192,6 +193,54 @@ When the open sync PR already has the rebuilt content, the workflow pushes nothi
 
 A failed run opens an issue here labelled `red-lane:sdk-fixtures-personas` and `team:sdk`, through the scheduled run status workflow above. The next passing run closes it.
 
+## Release the SDKs
+
+All seven V3 SDKs share one version number. `sdk-release-train.yml` releases only the SDKs with unreleased changes, all at the same version, and a person approves every release.
+
+1. At 07:00 UTC each day, after the spec sync, the plan job reads each SDK's tags and the `## [Unreleased]` section of its `CHANGELOG.md`. An SDK is released when it has entries there and its cadence is due.
+2. The plan works out the bump each of those SDKs needs:
+   - major if a PR labelled `breaking` merged since its last release
+   - minor if Unreleased has an Added or Deprecated section
+   - patch otherwise
+3. It applies the highest of those bumps to the highest version any SDK has released. That is the version for the run. SDKs with nothing to release skip it, so an SDK can go from 13.1.0 straight to 13.3.0.
+   - While a batch is still landing, its version is kept. An SDK whose release PR is still open is planned at that version again, and tags from that batch don't raise the base. So when one SDK of a v14.0.0 batch is merged and tagged, the others stay at v14.0.0, not v15.0.0.
+   - A new SDK joins the open batch when its version covers what that SDK needs. Only a bigger bump moves the batch to a new version, which rebuilds its PRs.
+4. For each SDK, a bump job runs the SDK's own `scripts/bump-version.sh <version>` on its default branch and hands the change to a publish job as a patch. The publish job applies it to a fresh clone, pushes `release/v<version>` and opens one PR labelled `release`, or updates the open one. It asks the people in `SDK_RELEASE_REVIEWERS` to review. A release PR already at that version and built on the current default branch is left alone, so its approvals are kept. A release PR for an older version is closed.
+5. Every hour, the land job looks at the open release PRs at the newest version. It merges them all, by squash, once every one is approved, has passing checks and is up to date with its base branch. Then it pushes a `v<version>` tag on each merge commit, and each SDK's `release.yml` publishes the package.
+
+The train never merges a major release. It judges this against each SDK's own last release, and records it in the PR, so the rest of a major batch stays manual after one SDK is tagged. Merge each major release PR yourself once it's approved, and the next hourly run pushes its tag. The train also tags any other release PR merged in the last 14 days whose version is newer than the SDK's last tag.
+
+A new commit on an SDK's default branch makes the next daily run rebuild that SDK's release PR. That dismisses its approvals, and the batch waits for it.
+
+SDKs with different cadences can share a batch. For example, with `{"rust": "weekly"}`, Monday's run can put Go and Rust in one batch. Go's PR stays at that version on the following days, and the batch merges once Rust's PR is approved too.
+
+Release PRs a person opens, such as one cut by hand, are left alone. They never join a batch and the train never tags them. If someone pushes a commit to one of the train's own release PRs, the train won't rebuild that PR over it: the publish job fails until the PR is closed or its branch is reset. The train also refuses to push to an existing `release/v<version>` branch unless one of its own open PRs uses it. That publish job fails, which raises the failed-run alert. If the train pushes a branch but can't open its PR, it deletes the branch so the next run isn't blocked.
+
+### Alerts
+
+Breaking changes and anything else the train can't settle wait for a person, and the train says so:
+
+- While a release needs a person, the land job keeps one issue open here, titled "SDK release needs a person" and labelled `sdk-release-needs-a-person`. That covers a major release waiting to be merged, a release PR with failing checks, and a merge or tag the train couldn't do. Each hourly run rewrites the issue only when the list changes, and closes it once nothing is left. Waiting for an approval doesn't count.
+- A failed run opens an issue labelled `red-lane:sdk-release-train` and `team:sdk`, through the scheduled run status workflow above. The next passing run closes it.
+- Both post to Slack when the `SDK_RELEASE_SLACK_WEBHOOK_URL` secret holds an incoming webhook: the "needs a person" issue when it opens and closes, the red-lane issue as described above.
+
+### Settings
+
+| Variable | Use |
+|---|---|
+| `SDK_RELEASE_CADENCE` | `manual`, `on-merge`, `daily`, `weekly` (Mondays) or `monthly` (first Monday). Unset means `manual`. |
+| `SDK_RELEASE_CADENCE_OVERRIDES` | Optional JSON giving some SDKs a different cadence, such as `{"rust": "weekly"}`. |
+| `SDK_RELEASE_REVIEWERS` | Optional comma-separated GitHub logins to ask for review on new release PRs. |
+
+`on-merge` SDKs are checked every hour, not once a day. A manual run ignores the cadence and can name the SDKs to release in `repos`.
+
+The SDK's bump script never shares a job with a write token, as Claude never does in the spec sync:
+
+- The bump job has no `SMILE_GHA_BOT` key, no bundle key and no `GITHUB_TOKEN` permissions. It clones with a `SPEC_SYNC_READER` token in an earlier step (`smileid-sdk-rust` is private), then turns off root and Docker. The script runs as its own unprivileged user, `bumper`, with an empty environment and its own copy of the clone. That user can't read the job's processes or files, such as the reader key or the artifact upload token, and all its processes are killed before the next step. It uploads the patch encrypted to `BUNDLE_CERT`, because this repository's artifacts are public.
+- The publish job holds `SMILE_GHA_BOT` (contents and pull requests write on that one SDK) and runs only `git`, `gh`, `tar` and `openssl`. It decrypts the bundle with `SPEC_SYNC_BUNDLE_KEY`, accepts only `meta.json` and `patch.diff`, and applies the patch to a fresh clone that nothing else has touched. It refuses a patch that changes `.github/` or `.gitmodules` (checking raw paths, so unusual characters can't hide one), and a bundle made against an older commit than the default branch. It takes the PR's changelog notes from its own clone, not from the bundle, and only the last state marker in a PR description counts.
+
+The plan job reads with `SPEC_SYNC_READER`, and mints a `SMILE_GHA_BOT` token that can only read pull requests, just to learn the bot's name. The land job uses `SMILE_GHA_BOT` with contents and pull requests write. The train merges and tags only release PRs its bot opened: the state marker in a PR description isn't enough, because anyone who can edit the PR can write it. Merging needs an approval, as for any other PR: the bot has no bypass. Because the bot pushes the tags, not `GITHUB_TOKEN`, the SDKs' release workflows run.
+
 ## Merge safety
 
 `merge-safety.yml` has no caller. An org ruleset with a "require workflow" rule runs it on every PR, pinned to a commit SHA from `main`. The ruleset is in evaluate mode, so GitHub runs the workflow but never blocks a merge on it.
@@ -222,4 +271,4 @@ Third-party actions inside these workflows are pinned to commit SHAs too. Keep t
 
 ## Check changes
 
-Run `actionlint .github/workflows/*.yml`, `tests/deploy-status.sh` (needs `yq` and `xmllint`), `tests/merge-safety.sh` (needs `yq` and `jq`), `tests/scheduled-run-status.sh` (needs `yq` and `jq`), `python3 -m unittest discover -s tests` and `tests/spec-sync-state.sh`. The `Check workflows` workflow runs them on every PR. Before updating callers to a new commit, test it here. On a branch, change the pins in `pr-hygiene.yml` to that commit and run `Check shared PR workflows` manually from that branch with `dry-run` enabled. Author assignment uses `pull_request_target`, so it runs from `main`: merge the pin change, then open a PR to check it.
+Run `actionlint .github/workflows/*.yml`, `tests/deploy-status.sh` (needs `yq` and `xmllint`), `tests/merge-safety.sh` (needs `yq` and `jq`), `tests/scheduled-run-status.sh` (needs `yq` and `jq`), `python3 -m unittest discover -s tests` (the spec sync and release train tests) and `tests/spec-sync-state.sh`. The `Check workflows` workflow runs them on every PR. Before updating callers to a new commit, test it here. On a branch, change the pins in `pr-hygiene.yml` to that commit and run `Check shared PR workflows` manually from that branch with `dry-run` enabled. Author assignment uses `pull_request_target`, so it runs from `main`: merge the pin change, then open a PR to check it.
