@@ -181,13 +181,18 @@ def rollup(*conclusions):
              "conclusion": c, "startedAt": "2026-11-25T07:00:00Z"} for i, c in enumerate(conclusions)]
 
 
-def release_pr(number, version, *, approved=True, checks=("SUCCESS",), merge_state="CLEAN", draft=False, marker=True):
+BOT = "smile-gha-bot[bot]"
+
+
+def release_pr(number, version, *, approved=True, checks=("SUCCESS",), merge_state="CLEAN", draft=False, marker=True,
+               author="app/smile-gha-bot"):
     return {
         "number": number, "url": f"https://github.com/smileidentity/x/pull/{number}", "title": f"Release v{version}",
         "headRefName": f"release/v{version}", "headRefOid": f"sha{number}", "isDraft": draft,
         "isCrossRepository": False, "reviewDecision": "APPROVED" if approved else "REVIEW_REQUIRED",
         "mergeStateStatus": merge_state, "statusCheckRollup": rollup(*checks),
         "body": t.write_marker({"version": version, "base_sha": "b"}) if marker else "",
+        "author": {"login": author, "is_bot": author.startswith("app/")},
     }
 
 
@@ -217,7 +222,7 @@ class LandTest(unittest.TestCase):
                "smileid-sdk-ruby": [release_pr(5, "13.3.0", marker=False)]}
         fake = FakeGh()
         with mock.patch.object(t, "gh", fake):
-            report = t.land_batch(prs, "tok", self.LATEST)
+            report = t.land_batch(prs, "tok", self.LATEST, BOT)
         self.assertEqual(report["merged"], [])
         self.assertEqual(set(report["waiting"]), {"smileid-sdk-java", "smileid-sdk-js", "smileid-sdk-php", "smileid-sdk-ruby"})
         self.assertIn("it is not approved", report["waiting"]["smileid-sdk-java"])
@@ -230,7 +235,7 @@ class LandTest(unittest.TestCase):
         prs = {"smileid-sdk-go": [release_pr(1, "13.3.0")], "smileid-sdk-rust": [release_pr(2, "13.3.0")]}
         fake = FakeGh()
         with mock.patch.object(t, "gh", fake):
-            report = t.land_batch(prs, "tok", self.LATEST)
+            report = t.land_batch(prs, "tok", self.LATEST, BOT)
         self.assertEqual(report["merged"], ["smileid-sdk-go", "smileid-sdk-rust"])
         merges = [c for c in fake.calls if c[:3] == ["api", "-X", "PUT"]]
         self.assertEqual(len(merges), 2)
@@ -238,11 +243,29 @@ class LandTest(unittest.TestCase):
         self.assertIn("merge_method=squash", merges[0])
         self.assertIn("commit_title=Release v13.3.0 (#1)", merges[0])
 
+    def test_never_merges_a_pr_someone_else_opened(self):
+        prs = {"smileid-sdk-go": [release_pr(1, "13.3.0", author="mallory")]}
+        fake = FakeGh()
+        with mock.patch.object(t, "gh", fake):
+            report = t.land_batch(prs, "tok", self.LATEST, BOT)
+        self.assertEqual(report["merged"], [])
+        self.assertIn("mallory opened it, not the release train", report["waiting"]["smileid-sdk-go"])
+        self.assertEqual(fake.calls, [])
+
+    def test_nothing_merges_without_a_bot_name(self):
+        self.assertIn("app/smile-gha-bot opened it, not the release train", t.blockers(release_pr(1, "13.3.0"), "13.3.0", ""))
+
+    def test_by_train(self):
+        for login in ("app/smile-gha-bot", "smile-gha-bot[bot]", "smile-gha-bot"):
+            self.assertTrue(t.by_train({"author": {"login": login}}, BOT), login)
+        self.assertFalse(t.by_train({"author": {"login": "app/other-bot"}}, BOT))
+        self.assertFalse(t.by_train({}, BOT))
+
     def test_never_merges_a_major(self):
         prs = {"smileid-sdk-go": [release_pr(1, "14.0.0")]}
         fake = FakeGh()
         with mock.patch.object(t, "gh", fake):
-            report = t.land_batch(prs, "tok", self.LATEST)
+            report = t.land_batch(prs, "tok", self.LATEST, BOT)
         self.assertTrue(report["major"])
         self.assertEqual(fake.calls, [])
 
@@ -254,20 +277,21 @@ class LandTest(unittest.TestCase):
         self.assertEqual([p["number"] for p in stale], [2])
 
     def test_no_release_prs(self):
-        self.assertEqual(t.land_batch({}, "tok", self.LATEST)["merged"], [])
+        self.assertEqual(t.land_batch({}, "tok", self.LATEST, BOT)["merged"], [])
 
     def test_draft_and_pending_checks_block(self):
-        self.assertIn("it is a draft", t.blockers(release_pr(1, "13.3.0", draft=True), "13.3.0"))
+        self.assertIn("it is a draft", t.blockers(release_pr(1, "13.3.0", draft=True), "13.3.0", BOT))
         pending = release_pr(1, "13.3.0")
         pending["statusCheckRollup"][0]["status"] = "IN_PROGRESS"
-        self.assertIn("its checks are pending", t.blockers(pending, "13.3.0"))
-        self.assertIn("its checks are none", t.blockers(release_pr(1, "13.3.0", checks=()), "13.3.0"))
+        self.assertIn("its checks are pending", t.blockers(pending, "13.3.0", BOT))
+        self.assertIn("its checks are none", t.blockers(release_pr(1, "13.3.0", checks=()), "13.3.0", BOT))
 
 
 class TagTest(unittest.TestCase):
     def merged(self, number, version, merged_at="2026-11-25T06:00:00Z"):
         return {"number": number, "url": f"u{number}", "headRefName": f"release/v{version}",
-                "mergeCommit": {"oid": f"m{number}"}, "mergedAt": merged_at, "isCrossRepository": False}
+                "mergeCommit": {"oid": f"m{number}"}, "mergedAt": merged_at, "isCrossRepository": False,
+                "author": {"login": "app/smile-gha-bot"}}
 
     def tag(self, prs, latest):
         calls = []
@@ -279,7 +303,7 @@ class TagTest(unittest.TestCase):
             return (0, "{}", "")
 
         with mock.patch.object(t, "gh", fake):
-            pushed = t.tag_merged("smileid-sdk-go", "tok", latest, NOW)
+            pushed = t.tag_merged("smileid-sdk-go", "tok", latest, NOW, BOT)
         return pushed, [c for c in calls if c[:3] == ["api", "-X", "POST"]]
 
     def test_tags_a_merged_release(self):
@@ -292,7 +316,8 @@ class TagTest(unittest.TestCase):
         old = self.merged(1, "13.4.0", merged_at="2026-10-01T00:00:00Z")
         fork = dict(self.merged(2, "13.4.0"), isCrossRepository=True)
         odd = dict(self.merged(3, "13.4.0"), headRefName="release/next")
-        pushed, posts = self.tag([self.merged(4, "13.3.0"), old, fork, odd], "13.3.0")
+        person = dict(self.merged(5, "13.4.0"), author={"login": "mallory"})
+        pushed, posts = self.tag([self.merged(4, "13.3.0"), old, fork, odd, person], "13.3.0")
         self.assertEqual(pushed, [])
         self.assertEqual(posts, [])
 
@@ -309,8 +334,8 @@ class PrepareTest(unittest.TestCase):
                 return "head\n"
             return ""
 
-        with mock.patch.object(t, "run", fake_run), mock.patch.object(t, "open_release_prs", lambda r, tok: existing):
-            result = t.prepare(u=u, workdir="/tmp/x", token="tok", bot_name="b", bot_email="e", run_url=RUN,
+        with mock.patch.object(t, "run", fake_run), mock.patch.object(t, "open_release_prs", lambda r, tok, bot: existing):
+            result = t.prepare(u=u, workdir="/tmp/x", token="tok", bot_name=BOT, bot_email="e", run_url=RUN,
                                reviewers=[], today="2026-11-25")
         self.assertEqual(result["status"], "unchanged")
         self.assertFalse(any("bump-version.sh" in " ".join(c) for c in calls))
@@ -323,29 +348,37 @@ class PrepareTest(unittest.TestCase):
                 return (1, "", "nothing unreleased")
             return "x\n" if check else (0, "", "")
 
-        with mock.patch.object(t, "run", fake_run), mock.patch.object(t, "open_release_prs", lambda r, tok: []):
+        with mock.patch.object(t, "run", fake_run), mock.patch.object(t, "open_release_prs", lambda r, tok, bot: []):
             with self.assertRaisesRegex(t.TrainError, "nothing unreleased"):
-                t.prepare(u=u, workdir="/tmp/x", token="tok", bot_name="b", bot_email="e", run_url=RUN,
+                t.prepare(u=u, workdir="/tmp/x", token="tok", bot_name=BOT, bot_email="e", run_url=RUN,
                           reviewers=[], today="2026-11-25")
 
     def test_bump_script_gets_no_token(self):
         u = {"repo": "smileid-sdk-go", "version": "13.3.0", "part": "minor", "current": "13.2.0", "breaking_prs": []}
         seen = {}
 
-        def fake_run(cmd, check=True, env=None, **kwargs):
+        def fake_run(cmd, check=True, env=None, inherit_env=True, **kwargs):
             if "bump-version.sh" in " ".join(cmd):
                 seen.update(env or {})
+                seen["inherit_env"] = inherit_env
                 return (0, "13.3.0\n", "")
             if cmd[:2] == ["gh", "pr"] and "create" in cmd:
                 return "https://github.com/smileidentity/smileid-sdk-go/pull/9\n"
             return "main\n" if check else (0, "", "")
 
-        with mock.patch.object(t, "run", fake_run), mock.patch.object(t, "open_release_prs", lambda r, tok: []):
-            result = t.prepare(u=u, workdir="/tmp/x", token="tok", bot_name="b", bot_email="e", run_url=RUN,
+        with mock.patch.object(t, "run", fake_run), mock.patch.object(t, "open_release_prs", lambda r, tok, bot: []):
+            result = t.prepare(u=u, workdir="/tmp/x", token="tok", bot_name=BOT, bot_email="e", run_url=RUN,
                                reviewers=["alice"], today="2026-11-25")
         self.assertEqual(result["status"], "opened")
-        self.assertEqual(seen.get("GH_TOKEN"), "")
-        self.assertNotIn("GIT_CONFIG_VALUE_0", seen)
+        self.assertIs(seen["inherit_env"], False)
+        self.assertFalse([k for k in seen if "TOKEN" in k or k.startswith("GIT_CONFIG")])
+
+    def test_clean_environment_drops_tokens(self):
+        with mock.patch.dict(t.os.environ, {"WRITE_TOKEN": "secret", "GH_TOKEN": "secret", "PATH": "/usr/bin:/bin"}):
+            out = t.run(["env"], inherit_env=False, env={"BUMP_DATE": "2026-11-25"})
+        self.assertNotIn("secret", out)
+        self.assertIn("BUMP_DATE=2026-11-25", out)
+        self.assertIn("PATH=/usr/bin:/bin", out)
 
 
 class AttentionTest(unittest.TestCase):
@@ -353,7 +386,7 @@ class AttentionTest(unittest.TestCase):
 
     def test_major_release_needs_a_person(self):
         with mock.patch.object(t, "gh", FakeGh()):
-            report = t.land_batch({"smileid-sdk-go": [release_pr(1, "14.0.0")]}, "tok", self.LATEST)
+            report = t.land_batch({"smileid-sdk-go": [release_pr(1, "14.0.0")]}, "tok", self.LATEST, BOT)
         (item,) = t.attention_items(report)
         self.assertIn("pull/1: v14.0.0 is a major release", item)
 
@@ -361,13 +394,13 @@ class AttentionTest(unittest.TestCase):
         prs = {"smileid-sdk-go": [release_pr(1, "13.3.0", checks=("FAILURE",))],
                "smileid-sdk-java": [release_pr(2, "13.3.0", approved=False)]}
         with mock.patch.object(t, "gh", FakeGh()):
-            report = t.land_batch(prs, "tok", self.LATEST)
+            report = t.land_batch(prs, "tok", self.LATEST, BOT)
         (item,) = t.attention_items(report)
         self.assertIn("pull/1: its checks are failing", item)
 
     def test_merge_and_tag_failures_need_a_person(self):
         with mock.patch.object(t, "gh", FakeGh(fail=["pulls/1/merge"])):
-            report = t.land_batch({"smileid-sdk-go": [release_pr(1, "13.3.0")]}, "tok", self.LATEST)
+            report = t.land_batch({"smileid-sdk-go": [release_pr(1, "13.3.0")]}, "tok", self.LATEST, BOT)
         report["tag_failed"] = {"smileid-sdk-rust": ["couldn't push the v13.3.0 tag for u. See the run log."]}
         items = t.attention_items(report)
         self.assertEqual(len(items), 2)

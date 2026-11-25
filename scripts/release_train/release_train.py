@@ -62,10 +62,20 @@ class TrainError(Exception):
 # Running commands
 
 
-def run(cmd, *, cwd=None, env=None, check=True, input_text=None):
-    """Run a command and return its stdout. Tests replace this function."""
+# What a command run without the job's environment still gets. No variable
+# that could hold a token or key is passed on.
+CLEAN_ENV_KEYS = ("PATH", "HOME", "LANG", "LC_ALL", "TMPDIR", "RUNNER_TEMP")
+
+
+def run(cmd, *, cwd=None, env=None, check=True, input_text=None, inherit_env=True):
+    """Run a command and return its stdout. Tests replace this function.
+
+    With inherit_env=False the command gets only CLEAN_ENV_KEYS from this
+    process's environment, plus env.
+    """
+    base = os.environ if inherit_env else {k: os.environ[k] for k in CLEAN_ENV_KEYS if k in os.environ}
     result = subprocess.run(
-        cmd, cwd=cwd, env={**os.environ, **(env or {})}, input=input_text,
+        cmd, cwd=cwd, env={**base, **(env or {})}, input=input_text,
         text=True, capture_output=True, check=False,
     )
     if check and result.returncode != 0:
@@ -356,11 +366,21 @@ def render_pr_body(*, u, notes, base_sha, run_url):
     return "\n".join(lines)
 
 
-def open_release_prs(repo, token):
+def by_train(pr, bot):
+    """Whether the train's bot opened the PR. gh shows a GitHub App author as app/<slug>."""
+    slug = (bot or "").removesuffix("[bot]")
+    login = (pr.get("author") or {}).get("login", "")
+    return bool(slug) and login in (bot, slug, f"app/{slug}")
+
+
+def open_release_prs(repo, token, bot):
+    """The open release PRs the train opened. A person's release PR is never updated or closed."""
     out = gh(["pr", "list", "--repo", f"{ORG}/{repo}", "--label", LABEL, "--state", "open",
-              "--json", "number,url,title,body,headRefName,isCrossRepository,headRefOid", "--limit", "20"], token)
+              "--json", "number,url,title,body,headRefName,isCrossRepository,headRefOid,author", "--limit", "20"],
+             token)
     return [pr for pr in json.loads(out or "[]")
-            if not pr.get("isCrossRepository", True) and pr.get("headRefName", "").startswith(BRANCH_PREFIX)]
+            if not pr.get("isCrossRepository", True) and pr.get("headRefName", "").startswith(BRANCH_PREFIX)
+            and by_train(pr, bot)]
 
 
 def prepare(*, u, workdir, token, bot_name, bot_email, run_url, reviewers, today):
@@ -374,7 +394,7 @@ def prepare(*, u, workdir, token, bot_name, bot_email, run_url, reviewers, today
     branch = f"{BRANCH_PREFIX}{version}"
     git(["clone", "--quiet", f"{GIT_BASE}/{full}.git", workdir], cwd=None, token=token)
     base_sha = git(["rev-parse", "HEAD"], cwd=workdir).strip()
-    existing = open_release_prs(repo, token)
+    existing = open_release_prs(repo, token, bot_name)
     for pr in existing:
         marker = read_marker(pr.get("body"))
         if pr["headRefName"] == branch and marker.get("base_sha") == base_sha and marker.get("version") == version:
@@ -383,10 +403,11 @@ def prepare(*, u, workdir, token, bot_name, bot_email, run_url, reviewers, today
 
     notes = unreleased(git(["show", "HEAD:CHANGELOG.md"], cwd=workdir))
     git(["checkout", "--quiet", "-B", branch], cwd=workdir)
-    # The bump script is the SDK's own, from its default branch. It gets no token.
+    # The bump script is the SDK's own, from its default branch. It runs without
+    # the job's environment, so it can't read WRITE_TOKEN, GH_TOKEN or any other token.
     code, out, err = run(["bash", "scripts/bump-version.sh", version], cwd=workdir,
-                         env={"BUMP_DATE": today, "RELEASE_DATE": today, "BUMP_VERSION_DATE": today,
-                              "GH_TOKEN": "", "GITHUB_TOKEN": ""}, check=False)
+                         env={"BUMP_DATE": today, "RELEASE_DATE": today, "BUMP_VERSION_DATE": today},
+                         check=False, inherit_env=False)
     if code != 0:
         raise TrainError(f"{repo}: scripts/bump-version.sh {version} failed: {(err or out).strip()[-1500:]}")
     printed = (out or "").strip().splitlines()[-1:] or [""]
@@ -462,9 +483,13 @@ def pr_version(pr):
     return version if VERSION_RE.match(version) else None
 
 
-def blockers(pr, version):
+def blockers(pr, version, bot):
     """Why a release PR can't merge yet; empty when it can."""
     problems = []
+    # The marker alone proves nothing: anyone who can edit the PR can write it.
+    if not by_train(pr, bot):
+        login = (pr.get("author") or {}).get("login") or "unknown"
+        problems.append(f"{login} opened it, not the release train")
     if pr.get("isDraft"):
         problems.append("it is a draft")
     if pr.get("reviewDecision") != "APPROVED":
@@ -497,7 +522,7 @@ def find_batch(prs_by_repo):
     return newest, batch, stale
 
 
-def land_batch(prs_by_repo, token, latest_versions):
+def land_batch(prs_by_repo, token, latest_versions, bot):
     """Merge the batch when every PR in it is approved and green. Returns a report."""
     version, batch, stale = find_batch(prs_by_repo)
     for pr in stale:
@@ -505,7 +530,7 @@ def land_batch(prs_by_repo, token, latest_versions):
     if not batch:
         return {"version": None, "merged": [], "waiting": {}}
     urls = {repo: pr["url"] for repo, pr in batch.items()}
-    waiting = {repo: blockers(pr, version) for repo, pr in batch.items()}
+    waiting = {repo: blockers(pr, version, bot) for repo, pr in batch.items()}
     waiting = {repo: why for repo, why in waiting.items() if why}
     base = max(latest_versions.values(), key=parse_version) if latest_versions else None
     if base and parse_version(version)[0] > parse_version(base)[0]:
@@ -533,16 +558,16 @@ def land_batch(prs_by_repo, token, latest_versions):
     return {"version": version, "merged": merged, "waiting": {}, "urls": urls, "merge_failed": failed}
 
 
-def tag_merged(repo, token, latest, now, errors=None):
+def tag_merged(repo, token, latest, now, bot, errors=None):
     """Push the tag for each recently merged release PR that has none. Returns the tags pushed."""
     full = f"{ORG}/{repo}"
     out = gh(["pr", "list", "--repo", full, "--label", LABEL, "--state", "merged", "--json",
-              "number,url,headRefName,mergeCommit,mergedAt,isCrossRepository", "--limit", "20"], token)
+              "number,url,headRefName,mergeCommit,mergedAt,isCrossRepository,author", "--limit", "20"], token)
     pushed = []
     cutoff = now - dt.timedelta(days=TAG_WINDOW_DAYS)
     for pr in sorted(json.loads(out or "[]"), key=lambda p: p.get("mergedAt") or ""):
         version = pr_version(pr)
-        if not version or pr.get("isCrossRepository", True) or not pr.get("mergeCommit"):
+        if not version or pr.get("isCrossRepository", True) or not pr.get("mergeCommit") or not by_train(pr, bot):
             continue
         merged_at = dt.datetime.fromisoformat(pr["mergedAt"].replace("Z", "+00:00"))
         if merged_at < cutoff:
@@ -640,14 +665,14 @@ def sync_attention_issue(repo_full, token, items, run_url, webhook=""):
     return "none"
 
 
-def land(token, now, repos=None):
+def land(token, now, bot, repos=None):
     repos = repos or list(SDK_REPOS)
     prs_by_repo, latest_versions = {}, {}
     for repo in repos:
         try:
             out = gh(["pr", "list", "--repo", f"{ORG}/{repo}", "--label", LABEL, "--state", "open", "--json",
                       "number,url,title,body,headRefName,headRefOid,isDraft,isCrossRepository,reviewDecision,"
-                      "mergeStateStatus,statusCheckRollup", "--limit", "20"], token)
+                      "mergeStateStatus,statusCheckRollup,author", "--limit", "20"], token)
             prs_by_repo[repo] = [pr for pr in json.loads(out or "[]") if not pr.get("isCrossRepository", True)
                                  and pr_version(pr)]
             tags = [line.split("refs/tags/", 1)[1] for line in
@@ -657,14 +682,14 @@ def land(token, now, repos=None):
         except TrainError as e:
             print(f"::warning::Could not read {repo}, so its release PRs were left alone: {e}")
     latest_versions = {r: v for r, v in latest_versions.items() if v}
-    report = land_batch(prs_by_repo, token, latest_versions)
+    report = land_batch(prs_by_repo, token, latest_versions, bot)
     tags, tag_failed = {}, {}
     for repo in repos:
         if repo not in latest_versions and repo not in prs_by_repo:
             continue
         try:
             errors = []
-            pushed = tag_merged(repo, token, latest_versions.get(repo), now, errors)
+            pushed = tag_merged(repo, token, latest_versions.get(repo), now, bot, errors)
             if errors:
                 tag_failed[repo] = errors
         except TrainError as e:
@@ -756,7 +781,11 @@ def main(argv=None):
                     bot_email=args.bot_email, run_url=args.run_url, reviewers=reviewers,
                     today=now.strftime("%Y-%m-%d"))
         elif args.command == "land":
-            report = land(os.environ["WRITE_TOKEN"], now)
+            bot = os.environ.get("RELEASE_TRAIN_BOT", "")
+            if not bot:
+                print("::warning::RELEASE_TRAIN_BOT is not set, so no release PR counts as the train's own: "
+                      "nothing is merged or tagged.")
+            report = land(os.environ["WRITE_TOKEN"], now, bot)
             lines = ["## Release train: merge and tag", ""]
             if report.get("version"):
                 if report.get("merged"):

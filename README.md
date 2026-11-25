@@ -228,7 +228,7 @@ Breaking changes and anything else the train can't settle wait for a person, and
 
 `on-merge` SDKs are checked every hour, not once a day. A manual run ignores the cadence and can name the SDKs to release in `repos`.
 
-The plan job reads with `SPEC_SYNC_READER`. The prepare and land jobs use `SMILE_GHA_BOT` with contents and pull requests write. Merging needs an approval, as for any other PR: the bot has no bypass. Because the bot pushes the tags, not `GITHUB_TOKEN`, the SDKs' release workflows run.
+The plan job reads with `SPEC_SYNC_READER`. The prepare and land jobs use `SMILE_GHA_BOT` with contents and pull requests write. The bump script runs without the job's environment, so it can't read the bot's token. The train merges and tags only release PRs its bot opened: the state marker in a PR description isn't enough, because anyone who can edit the PR can write it. Merging needs an approval, as for any other PR: the bot has no bypass. Because the bot pushes the tags, not `GITHUB_TOKEN`, the SDKs' release workflows run.
 
 ## Merge safety
 

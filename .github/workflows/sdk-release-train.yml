@@ -142,6 +142,8 @@ jobs:
         env:
           WRITE_TOKEN: ${{ steps.write-token.outputs.token }}
           ISSUE_TOKEN: ${{ github.token }}
+          # Only release PRs this bot opened are merged or tagged.
+          RELEASE_TRAIN_BOT: ${{ steps.write-token.outputs.app-slug }}[bot]
           SLACK_WEBHOOK_URL: ${{ secrets.SDK_RELEASE_SLACK_WEBHOOK_URL }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: python3 scripts/release_train/release_train.py land
