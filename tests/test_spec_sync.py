@@ -17,6 +17,7 @@ import spec_sync as s
 TEMPLATE = (ROOT / "scripts" / "spec_sync" / "prompt.md").read_text()
 NOW = "2026-11-09 06:00 UTC"
 RUN = "https://github.com/smileidentity/central-workflows/actions/runs/1"
+BOT = "smile-bot[bot]"
 
 
 def record(tag, previous, breaking=False, prs=(), summary="Added a field."):
@@ -833,10 +834,10 @@ class StatusTest(unittest.TestCase):
 
         def fake_gh(args, token, **kwargs):
             calls.append(args)
-            return json.dumps(listed) if args[:2] == ["pr", "list"] else ""
+            return json.dumps([dict(p, author={"login": "app/smile-bot"}) for p in listed]) if args[:2] == ["pr", "list"] else ""
 
         with mock.patch.object(s, "gh", fake_gh), mock.patch("builtins.print"):
-            found = s.promote_prs(["smileid-sdk-go"], "t")
+            found = s.promote_prs(["smileid-sdk-go"], "t", bot=BOT)
         self.assertEqual([c[:3] for c in calls if c[1] == "ready"], [["pr", "ready", "3"]])
         prs = found["smileid-sdk-go"]
         self.assertEqual([(p["number"], p["draft"], p["checks"]) for p in prs],
@@ -857,10 +858,10 @@ class StatusTest(unittest.TestCase):
 
         def fake_gh(args, token, **kwargs):
             calls.append(args)
-            return json.dumps(listed) if args[:2] == ["pr", "list"] else ""
+            return json.dumps([dict(p, author={"login": "app/smile-bot"}) for p in listed]) if args[:2] == ["pr", "list"] else ""
 
         with mock.patch.object(s, "gh", fake_gh), mock.patch("builtins.print", printed.append):
-            found = s.promote_prs(["smileid-sdk-go"], "t", "v3.12.0")
+            found = s.promote_prs(["smileid-sdk-go"], "t", "v3.12.0", bot=BOT)
         self.assertIn(["pr", "ready", "2", "--repo", "smileidentity/smileid-sdk-go", "--undo"], calls)
         self.assertEqual([c[2] for c in calls if c[:2] == ["pr", "ready"] and "--undo" not in c], ["4"])
         close = next(c for c in calls if c[:2] == ["pr", "close"])
@@ -880,7 +881,7 @@ class StatusTest(unittest.TestCase):
         # Without the newest tag nothing is held back.
         calls.clear()
         with mock.patch.object(s, "gh", fake_gh), mock.patch("builtins.print"):
-            s.promote_prs(["smileid-sdk-go"], "t")
+            s.promote_prs(["smileid-sdk-go"], "t", bot=BOT)
         self.assertFalse(any("--undo" in c for c in calls))
 
     def test_promote_carries_on_when_closing_or_undoing_fails(self):
@@ -894,11 +895,11 @@ class StatusTest(unittest.TestCase):
 
         def fake_gh(args, token, **kwargs):
             if args[:2] == ["pr", "list"]:
-                return json.dumps(listed)
+                return json.dumps([dict(p, author={"login": "app/smile-bot"}) for p in listed])
             raise s.SpecSyncError("not allowed")
 
         with mock.patch.object(s, "gh", fake_gh), mock.patch("builtins.print", printed.append):
-            found = s.promote_prs(["smileid-sdk-go"], "t", "v3.2.0")
+            found = s.promote_prs(["smileid-sdk-go"], "t", "v3.2.0", bot=BOT)
         self.assertEqual([(p["number"], p["draft"]) for p in found["smileid-sdk-go"]], [(6, False), (7, False)])
         self.assertTrue(any("Could not close u6" in str(m) for m in printed))
         self.assertTrue(any("Could not move u7 back to draft" in str(m) for m in printed))
@@ -912,13 +913,13 @@ class StatusTest(unittest.TestCase):
 
         def fake_gh(args, token, **kwargs):
             if args[:2] == ["pr", "list"]:
-                return json.dumps(listed)
+                return json.dumps([dict(p, author={"login": "app/smile-bot"}) for p in listed])
             if args[2] == "7":
                 raise s.SpecSyncError("gh pr ready failed (1): Resource not accessible by integration")
             return ""
 
         with mock.patch.object(s, "gh", fake_gh), mock.patch("builtins.print", printed.append):
-            found = s.promote_prs(["smileid-sdk-rust"], "t")
+            found = s.promote_prs(["smileid-sdk-rust"], "t", bot=BOT)
         self.assertEqual([(p["number"], p["draft"]) for p in found["smileid-sdk-rust"]], [(7, True), (8, False)])
         self.assertTrue(any(str(m).startswith("::warning::Could not mark u7 ready") for m in printed))
 
@@ -931,15 +932,50 @@ class StatusTest(unittest.TestCase):
         def fake_gh(args, token, **kwargs):
             if "smileidentity/smileid-sdk-go" in args:
                 raise s.SpecSyncError("gh pr list failed (1): GraphQL: timeout")
-            return json.dumps(listed)
+            return json.dumps([dict(p, author={"login": "app/smile-bot"}) for p in listed])
 
         with mock.patch.object(s, "gh", fake_gh), mock.patch("builtins.print", printed.append):
-            found = s.promote_prs(["smileid-sdk-go", "smileid-sdk-js"], "t")
+            found = s.promote_prs(["smileid-sdk-go", "smileid-sdk-js"], "t", bot=BOT)
         self.assertIsNone(found["smileid-sdk-go"])
         self.assertEqual([p["number"] for p in found["smileid-sdk-js"]], [3])
         self.assertTrue(any("Could not list the spec-sync pull requests in smileid-sdk-go" in str(m) for m in printed))
         body = s.render_status_issue(prs=found, runs={}, pending=[], last_processed=None, run_url="r", now="n")
         self.assertIn("| `smileid-sdk-go` | could not be read in this run |", body)
+
+    def test_promote_leaves_prs_a_person_opened_alone(self):
+        green = [{"__typename": "CheckRun", "status": "COMPLETED", "conclusion": "SUCCESS"}]
+        marker = s.write_marker(s.PR_MARKER, {"ready_ok": True, "spec_tag": "v3.1.0"})
+        listed = [
+            {"number": 2, "url": "u2", "isDraft": True, "headRefName": "spec-sync/rolling", "statusCheckRollup": green,
+             "isCrossRepository": False, "body": marker, "author": {"login": "mallory"}},
+            {"number": 3, "url": "u3", "isDraft": False, "headRefName": "spec-sync/x", "statusCheckRollup": green,
+             "isCrossRepository": False, "changedFiles": 0, "body": marker, "author": {"login": "app/other-bot"}},
+            {"number": 4, "url": "u4", "isDraft": True, "headRefName": "spec-sync/rolling", "statusCheckRollup": green,
+             "isCrossRepository": False, "body": marker},
+        ]
+        calls, printed = [], []
+
+        def fake_gh(args, token, **kwargs):
+            calls.append(args)
+            return json.dumps(listed) if args[:2] == ["pr", "list"] else ""
+
+        with mock.patch.object(s, "gh", fake_gh), mock.patch("builtins.print", printed.append):
+            found = s.promote_prs(["smileid-sdk-go"], "t", "v3.2.0", bot=BOT)
+        self.assertEqual([c for c in calls if c[:2] != ["pr", "list"]], [])
+        self.assertEqual(found["smileid-sdk-go"], [])
+        self.assertTrue(any("u2 has the spec-sync label, but mallory opened it" in str(m) for m in printed))
+        # Without a bot name, nothing counts as the workflow's own.
+        calls.clear()
+        listed[0]["author"] = {"login": "app/smile-bot"}
+        with mock.patch.object(s, "gh", fake_gh), mock.patch("builtins.print"):
+            s.promote_prs(["smileid-sdk-go"], "t", bot="")
+        self.assertEqual([c for c in calls if c[:2] != ["pr", "list"]], [])
+
+    def test_by_bot(self):
+        for login in ("app/smile-bot", "smile-bot[bot]", "smile-bot"):
+            self.assertTrue(s.by_bot({"author": {"login": login}}, BOT), login)
+        self.assertFalse(s.by_bot({"author": {"login": "app/smile-bot-2"}}, BOT))
+        self.assertFalse(s.by_bot({}, BOT))
 
     def test_find_open_pr_skips_forks(self):
         listed = [{"number": 7, "url": "u7", "isDraft": True, "body": "fork", "isCrossRepository": True},

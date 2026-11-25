@@ -691,6 +691,8 @@ jobs:
       - name: Mark green PRs ready and update the status issue
         env:
           APP_TOKEN: ${{ steps.app-token.outputs.token }}
+          # Only PRs this bot opened are marked ready, moved to draft or closed.
+          BOT: ${{ steps.app-token.outputs.app-slug }}[bot]
           ISSUE_TOKEN: ${{ github.token }}
           REPOS: ${{ needs.publish.result != 'skipped' && needs.plan.outputs.repos || '[]' }}
           SYNC_RESULT: ${{ needs.sync.result == 'success' && needs.publish.result || needs.sync.result }}

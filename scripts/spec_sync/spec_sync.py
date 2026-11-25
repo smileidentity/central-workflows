@@ -1583,8 +1583,19 @@ def is_behind(spec_tag, latest_api_tag):
     return bool(TAG_RE.match(spec_tag or "") and latest_api_tag and tag_key(spec_tag) < tag_key(latest_api_tag))
 
 
-def promote_prs(repos, token, latest_api_tag=None):
+def by_bot(pr, bot):
+    """Whether the workflow's bot opened the PR. gh shows a GitHub App author as app/<slug>."""
+    slug = (bot or "").removesuffix("[bot]")
+    login = (pr.get("author") or {}).get("login", "")
+    return bool(slug) and login in (bot, slug, f"app/{slug}")
+
+
+def promote_prs(repos, token, latest_api_tag=None, *, bot):
     """Mark green draft spec-sync PRs ready. Returns the open PRs per repo.
+
+    Only PRs the bot opened count. The state marker in a description isn't
+    enough, because anyone who can edit a PR can write it, so a person's PR
+    with the spec-sync label is never marked ready, moved to draft or closed.
 
     A PR written against an older spec than latest_api_tag goes back to draft,
     so it can't be merged with code the newer spec changed, until the next sync
@@ -1596,7 +1607,7 @@ def promote_prs(repos, token, latest_api_tag=None):
         try:
             out = gh(
                 ["pr", "list", "--repo", f"{ORG}/{repo}", "--label", LABEL, "--state", "open",
-                 "--json", "number,url,title,isDraft,body,headRefName,statusCheckRollup,isCrossRepository,changedFiles",
+                 "--json", "number,url,title,isDraft,body,headRefName,statusCheckRollup,isCrossRepository,changedFiles,author",
                  "--limit", "50"],
                 token,
             )
@@ -1607,6 +1618,11 @@ def promote_prs(repos, token, latest_api_tag=None):
         prs = []
         for pr in json.loads(out or "[]"):
             if pr.get("isCrossRepository", True):
+                continue
+            if not by_bot(pr, bot):
+                login = (pr.get("author") or {}).get("login") or "unknown"
+                print(f"::notice::{pr['url']} has the {LABEL} label, but {login} opened it, not the workflow, "
+                      "so it was left alone.")
                 continue
             if pr.get("changedFiles") == 0 and str(pr.get("headRefName", "")).startswith("spec-sync/"):
                 try:
@@ -1943,7 +1959,11 @@ def main(argv=None):
             issue_token = os.environ["ISSUE_TOKEN"]
             repo_full = os.environ.get("GITHUB_REPOSITORY", f"{ORG}/central-workflows")
             api_tags = Path(args.api_tags_file).read_text().split() if args.api_tags_file else []
-            prs = promote_prs(ALL_REPOS, token, latest_tag(api_tags))
+            bot = os.environ.get("BOT", "")
+            if not bot:
+                print("::warning::BOT is not set, so no spec-sync PR counts as the workflow's own: none was marked "
+                      "ready, moved to draft or closed.")
+            prs = promote_prs(ALL_REPOS, token, latest_tag(api_tags), bot=bot)
             results = [read_json(p, {}) for p in sorted(Path(args.results_dir).glob("**/job-result.json"))]
             issue = find_status_issue(repo_full, issue_token)
             previous = read_marker(issue["body"], ISSUE_MARKER).get("runs", {}) if issue else {}
